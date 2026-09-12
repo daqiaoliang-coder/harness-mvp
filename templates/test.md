@@ -1,0 +1,25 @@
+---
+node: test
+next: ~
+inputs:
+  - issue.title
+  - issue.body
+---
+
+# 节点：测试验证
+
+## 输入
+
+- 需求标题：{{issue.title}}
+- 需求描述：
+{{issue.body}}
+
+## 执行指引
+
+1. 运行测试套件
+2. 输出测试报告摘要
+3. 如果失败，给出失败原因和建议
+
+## 输出
+
+输出测试结论（PASS / FAIL）和关键指标。
