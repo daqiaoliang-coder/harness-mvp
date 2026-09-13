@@ -11,6 +11,7 @@ import { Scheduler } from './scheduler.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { createHttpApp } from './http.js';
 import { attachWebSocketServer } from './ws.js';
+import { startFeishuNotifier } from './notifier.js';
 
 const config = loadConfig();
 const store = new EventStore(config.dbPath);
@@ -30,6 +31,12 @@ const server = app.listen(config.httpPort, () => {
 });
 
 const wss = attachWebSocketServer({ server, config, store, bus, scheduler });
+
+// 飞书通知必须在 scheduler.start() 之前订阅：bus 事件不重放，
+// 晚订阅会漏掉启动后第一轮 tick 派发的 run.dispatched。
+// 未配置 webhook 时 startFeishuNotifier 内部为空操作，不阻断启动。
+const stopNotifier = startFeishuNotifier({ config, bus });
+
 scheduler.start();
 
 /**

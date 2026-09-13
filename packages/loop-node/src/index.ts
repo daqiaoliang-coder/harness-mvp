@@ -361,9 +361,26 @@ async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
   const prompt = renderPrompt(template, pruned);
 
   const workdir = path.join(config.workspaceDir, runId);
-  await fs.mkdir(workdir, { recursive: true });
   const promptFile = path.join(workdir, 'prompt.md');
-  await fs.writeFile(promptFile, prompt, 'utf8');
+  // prompt 落盘失败（磁盘满 / 无写权限 / 路径非法）必须显式回传失败结果：
+  // 裸 await 的 rejection 只会走进程级 unhandledRejection 兜底日志，
+  // gateway 侧该 launch 将一直悬在 running，只能等 worker_lost 才回收。
+  // 此处 agent 尚未拉起、slot 尚未登记，失败后无需清理任何资源。
+  try {
+    await fs.mkdir(workdir, { recursive: true });
+    await fs.writeFile(promptFile, prompt, 'utf8');
+  } catch (err) {
+    console.error(`[loop-node] ❌ prompt 落盘失败 runId=${runId}:`, (err as Error).message);
+    send({
+      type: 'run.result',
+      runId,
+      status: 'failed',
+      error: `prompt 文件写入失败: ${(err as Error).message}`,
+      retry,
+      preflight,
+    });
+    return;
+  }
 
   const args = [...config.agentArgs, promptFile];
 
