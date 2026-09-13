@@ -172,62 +172,87 @@ export class Scheduler {
   ) {
     const run = this.runsByRunId.get(runId);
     if (!run) return;
-
-    this.runsByRunId.delete(runId);
-    this.runsByIssue.delete(run.issueNumber);
     run.status = status;
 
     const worker = this.workers.get(run.workerId);
-    if (worker) {
-      worker.busy = false;
-      worker.currentRunId = undefined;
-    }
-
-    const issues = await this.deps.github.listIssues();
-    const issue = issues.find((i) => i.number === run.issueNumber);
-    if (!issue) return;
-
-    if (status === 'completed') {
-      const nextIndex = this.deps.config.pipeline.indexOf(run.nodeKey) + 1;
-      const next = this.deps.config.pipeline[nextIndex];
-
-      await this.deps.github.addComment(
-        issue.number,
-        [
-          `### ✅ 节点 \`${run.nodeKey}\` 执行完成`,
-          '',
-          '<details><summary>执行输出（尾部截取）</summary>',
-          '',
-          '```',
-          (output ?? '').slice(-3000),
-          '```',
-          '</details>',
-        ].join('\n'),
-      );
-
-      if (next) {
-        await this.deps.github.setLabels(issue.number, [`node:${next}`]);
-        this.emit('github', 'issue.node.advanced', {
-          workItemId: String(issue.number),
-          runId,
-          details: { from: run.nodeKey, to: next },
-        });
-      } else {
-        await this.deps.github.setLabels(issue.number, ['node:done']);
-        await this.deps.github.addComment(issue.number, '🎉 **流程完成**：所有节点已执行完毕。');
-        this.emit('github', 'issue.completed', { workItemId: String(issue.number), runId });
+    const releaseWorker = () => {
+      if (worker) {
+        worker.busy = false;
+        worker.currentRunId = undefined;
       }
-    } else {
-      await this.deps.github.addComment(
-        issue.number,
-        [
-          `### ❌ 节点 \`${run.nodeKey}\` 执行失败`,
-          '',
-          '```',
-          (error ?? 'unknown error').slice(0, 2000),
-          '```',
-        ].join('\n'),
-      );
+    };
+    // 锁必须在 GitHub 状态推进成功后才释放：评论/打标期间轮询会看到旧标签，
+    // 提前释放会导致同一节点被重复派发（at-most-once → at-least-once）。
+    const releaseRunLock = () => {
+      this.runsByRunId.delete(runId);
+      this.runsByIssue.delete(run.issueNumber);
+    };
+
+    try {
+      const issues = await this.deps.github.listIssues();
+      const issue = issues.find((i) => i.number === run.issueNumber);
+      if (!issue) {
+        releaseRunLock();
+        releaseWorker();
+        return;
+      }
+
+      if (status === 'completed') {
+        const nextIndex = this.deps.config.pipeline.indexOf(run.nodeKey) + 1;
+        const next = this.deps.config.pipeline[nextIndex];
+
+        await this.deps.github.addComment(
+          issue.number,
+          [
+            `### ✅ 节点 \`${run.nodeKey}\` 执行完成`,
+            '',
+            '<details><summary>执行输出（尾部截取）</summary>',
+            '',
+            '```',
+            (output ?? '').slice(-3000),
+            '```',
+            '</details>',
+          ].join('\n'),
+        );
+
+        if (next) {
+          await this.deps.github.setLabels(issue.number, [`node:${next}`]);
+          this.emit('github', 'issue.node.advanced', {
+            workItemId: String(issue.number),
+            runId,
+            details: { from: run.nodeKey, to: next },
+          });
+        } else {
+          await this.deps.github.setLabels(issue.number, ['node:done']);
+          await this.deps.github.addComment(issue.number, '🎉 **流程完成**：所有节点已执行完毕。');
+          await this.deps.github.closeIssue(issue.number);
+          this.emit('github', 'issue.completed', { workItemId: String(issue.number), runId });
+        }
+      } else {
+        await this.deps.github.addComment(
+          issue.number,
+          [
+            `### ❌ 节点 \`${run.nodeKey}\` 执行失败`,
+            '',
+            '```',
+            (error ?? 'unknown error').slice(0, 2000),
+            '```',
+          ].join('\n'),
+        );
+      }
+      releaseRunLock();
+      releaseWorker();
+    } catch (e) {
+      // GitHub 回写失败（含重试后仍失败）：保留 issue 当前标签，释放锁让后续轮询重新派发该节点
+      console.error('[scheduler] 回写 GitHub 失败，下轮轮询将按标签重试该节点:', (e as Error).message);
+      this.emit('harness', 'run.transition_failed', {
+        runId,
+        workItemId: String(run.issueNumber),
+        nodeId: run.workerId,
+        details: { error: (e as Error).message.slice(0, 500) },
+      });
+      releaseRunLock();
+      releaseWorker();
     }
   }
 

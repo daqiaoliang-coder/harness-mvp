@@ -6,6 +6,7 @@
 **开箱即用**：默认 mock 模式，不需要 GitHub token，不需要真实 Agent CLI。
 
 ## 目录结构
+
 ```txt
 harness-mvp/
 ├── README.md
@@ -27,36 +28,43 @@ harness-mvp/
 ```
 
 ## 架构
-```txt
-┌─────────────────────── 控制面 Gateway ────────────────────────┐
-│ │
-│ GitHub Issues ◄──► Scheduler ◄──► WebSocket Server │
-│ (事实源) (编排决策) (任务派发 / 状态上报) │
-│ │ │
-│ ▼ │
-│ SQLite EventStore ──► SSE ──► Dashboard │
-│ │
-└────────────────────────────┬───────────────────────────────────┘
-│ WebSocket (worker 主动连出)
-▼
-┌─────────────────────── 执行面 loop-node ──────────────────────┐
-│ │
-│ 连接管理 ──► 模板加载 ──► Prompt 渲染 ──► node-pty ──► Agent │
-│ │ │
-│ └─► stdout 流式上报 │
-│ │
-└────────────────────────────────────────────────────────────────┘
+
+```mermaid
+flowchart TB
+    subgraph Gateway["控制面 Gateway"]
+        Issues["GitHub Issues（事实源）"] <--> Scheduler["Scheduler（编排决策）"]
+        Scheduler <--> WS["WebSocket Server<br/>（任务派发 / 状态上报）"]
+        Scheduler --> Store[("SQLite EventStore")]
+        Store --> SSE["SSE"]
+        SSE --> Dashboard["Dashboard"]
+    end
+
+    subgraph LoopNode["执行面 loop-node"]
+        direction LR
+        Conn["连接管理"] --> Tpl["模板加载"] --> Render["Prompt 渲染"] --> PTY["node-pty"] --> Agent["Agent"]
+        Agent -.->|stdout 流式上报| Conn
+    end
+
+    WS <-->|"WebSocket（worker 主动连出）"| Conn
 ```
+
+<br />
 
 三个分离：
 
 1. **流程状态 vs 运行时状态**：Issue 标签是流程状态，Gateway 只存 runId / 事件流
-2. **控制面 vs 执行面**：Gateway 决定「做什么」，loop-node 决定「怎么做」
-3. **业务模板 vs 通用引擎**：节点逻辑写在 `templates/*.md`，引擎只负责加载渲染
+2. **控制面 vs 执行面**：Gateway 决定「做什么」，loop-node 决定「怎么做」。两者不共享内存、不共享数据库。
+3. **业务模板 vs 通用引擎**：节点逻辑写在 `templates/*.md`，引擎只负责加载、渲染、执行。
+
+把 GitHub 换成 Meego、Jira 或 Linear，只需实现 GithubClient。
+把 mock agent 换成 Claude Code / Codex，只需设置 AGENT_CMD。
+架构本身不变。
 
 ## 快速开始
 
 ```bash
 npm install
 npm run dev
+
+```
 

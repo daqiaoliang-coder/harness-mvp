@@ -12,6 +12,7 @@ export interface GithubClient {
   listIssues(): Promise<Issue[]>;
   addComment(issueNumber: number, body: string): Promise<void>;
   setLabels(issueNumber: number, harnessLabels: string[]): Promise<void>;
+  closeIssue(issueNumber: number): Promise<void>;
 }
 
 const NODE_PREFIX = 'node:';
@@ -55,15 +56,43 @@ function realClient(config: GatewayConfig): GithubClient {
     'X-GitHub-Api-Version': '2022-11-28',
   };
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const MAX_ATTEMPTS = 4;
+
   async function call(p: string, init?: RequestInit) {
-    const res = await fetch(base + p, {
-      ...init,
-      headers: { ...headers, ...((init?.headers as Record<string, string>) ?? {}) },
-    });
-    if (!res.ok) {
-      throw new Error(`GitHub ${res.status} ${p}: ${await res.text()}`);
+    const method = (init?.method ?? 'GET').toUpperCase();
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const res = await fetch(base + p, {
+          ...init,
+          headers: { ...headers, ...((init?.headers as Record<string, string>) ?? {}) },
+        });
+        // GET 请求遇到 5xx/429 可安全重试；POST/PATCH/DELETE 已到达服务器，不自动重试
+        if ((res.status >= 500 || res.status === 429) && method === 'GET' && attempt < MAX_ATTEMPTS) {
+          await sleep(500 * 2 ** (attempt - 1));
+          continue;
+        }
+        if (!res.ok) {
+          throw new Error(`GitHub ${res.status} ${p}: ${await res.text()}`);
+        }
+        return res;
+      } catch (e) {
+        lastErr = e;
+        // 连接级失败（DNS/TLS 握手中断 ECONNRESET、网络瞬断）：请求未确认到达服务器，任何方法都可安全重试
+        const isConnectionLevel =
+          e instanceof TypeError || (e as { code?: string })?.code === 'ECONNRESET';
+        if (attempt < MAX_ATTEMPTS && isConnectionLevel) {
+          console.warn(
+            `[github] 请求失败(${attempt}/${MAX_ATTEMPTS})，${500 * 2 ** (attempt - 1)}ms 后重试: ${(e as Error).message}`,
+          );
+          await sleep(500 * 2 ** (attempt - 1));
+          continue;
+        }
+        throw e;
+      }
     }
-    return res;
+    throw lastErr;
   }
 
   return {
@@ -106,6 +135,13 @@ function realClient(config: GatewayConfig): GithubClient {
           body: JSON.stringify({ labels: harnessLabels }),
         });
       }
+    },
+
+    async closeIssue(n: number) {
+      await call(`/issues/${n}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ state: 'closed' }),
+      });
     },
   };
 }
@@ -151,6 +187,13 @@ function mockClient(): GithubClient {
       console.log(
         `\x1b[35m[mock-github]\x1b[0m 🏷  issue #${n} labels = [${issue.labels.join(', ')}]`,
       );
+    },
+
+    async closeIssue(n) {
+      const issue = issues.get(n);
+      if (!issue) return;
+      issue.state = 'closed';
+      console.log(`\x1b[35m[mock-github]\x1b[0m 🔒 issue #${n} 已关闭`);
     },
   };
 }

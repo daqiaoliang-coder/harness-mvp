@@ -97,7 +97,12 @@ export function attachWebSocketServer(ctx: Ctx) {
             nodeId: worker.nodeId,
             details: { error: msg.error },
           });
-          await ctx.scheduler.onRunResult(msg.runId, msg.status, msg.output, msg.error);
+          try {
+            await ctx.scheduler.onRunResult(msg.runId, msg.status, msg.output, msg.error);
+          } catch (e) {
+            // onRunResult 内部已有兜底；这里防止任何未预期异常导致 gateway 进程退出
+            console.error('[ws] onRunResult 处理失败:', e);
+          }
           break;
       }
     });

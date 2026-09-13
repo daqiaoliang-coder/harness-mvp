@@ -31,10 +31,27 @@ fi
 PROVIDER="${TRAE_PROVIDER:-doubao}"
 MODEL="${TRAE_MODEL:-doubao-seed-1.6}"
 MAX_STEPS="${TRAE_MAX_STEPS:-200}"
+if [[ -z "${TRAE_MODEL:-}" && "$PROVIDER" == "doubao" ]]; then
+  echo "[trae-runner] 警告: 未设置 TRAE_MODEL，将尝试 doubao-seed-1.6；" >&2
+  echo "  火山方舟通常要求接入点 ID（ep-xxx）或已开通的带日期模型 ID，请在 .env 或环境变量中设置 TRAE_MODEL。" >&2
+fi
+
+# trae-agent 不会为 doubao 注入默认地址（base_url 为空会打到 OpenAI 官方域名），
+# 因此 doubao 默认指向火山方舟 Ark；其他 provider 留空走各自官方 endpoint。
+BASE_URL="${TRAE_BASE_URL:-}"
+if [[ -z "$BASE_URL" && "$PROVIDER" == "doubao" ]]; then
+  BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
+fi
+BASE_URL_LINE=""
+if [[ -n "$BASE_URL" ]]; then
+  BASE_URL_LINE="    base_url: ${BASE_URL}"
+fi
 
 KEY_VAR="$(printf '%s' "$PROVIDER" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9_' '_')_API_KEY"
 if [[ -z "${!KEY_VAR:-}" ]]; then
-  echo "[trae-runner] 缺少 ${KEY_VAR}（TRAE_PROVIDER=${PROVIDER}）。请先 export ${KEY_VAR}=... 再启动 harness。" >&2
+  echo "[trae-runner] 缺少 ${KEY_VAR}（TRAE_PROVIDER=${PROVIDER}）。" >&2
+  echo "  请先 export ${KEY_VAR}=...，或把它存入 macOS 钥匙串（由 scripts/dev-real.sh 读取）：" >&2
+  echo "    security add-generic-password -a \"\$USER\" -s harness-${PROVIDER}-api-key -w" >&2
   exit 2
 fi
 
@@ -48,6 +65,7 @@ model_providers:
   ${PROVIDER}:
     api_key: ""
     provider: ${PROVIDER}
+${BASE_URL_LINE}
 models:
   harness_model:
     model_provider: ${PROVIDER}
@@ -71,9 +89,6 @@ agents:
 YAML
 
 ARGS=(run --config-file "$TMP_CFG" -f "$PROMPT_FILE" -w "$PWD" -ct simple)
-if [[ -n "${TRAE_BASE_URL:-}" ]]; then
-  ARGS+=(--model-base-url "$TRAE_BASE_URL")
-fi
 
-echo "[trae-runner] provider=${PROVIDER} model=${MODEL} cwd=${PWD} prompt=${PROMPT_FILE}" >&2
+echo "[trae-runner] provider=${PROVIDER} model=${MODEL} base_url=${BASE_URL:-<official>} cwd=${PWD}" >&2
 exec "$TRAE_CLI" "${ARGS[@]}"
