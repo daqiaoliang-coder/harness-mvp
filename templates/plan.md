@@ -4,6 +4,10 @@ next: code
 inputs:
   - issue.title
   - issue.body
+budget:
+  max_input_tokens: 200000
+  max_output_tokens: 50000
+  max_tool_calls: 200
 ---
 
 # 节点：技术方案

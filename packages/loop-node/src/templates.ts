@@ -1,11 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import YAML from 'yaml';
+import { DEFAULT_BUDGET, type BudgetConfig } from '@harness/shared';
 
 export interface Template {
   node: string;
   next?: string;
   inputs: string[];
+  budget: BudgetConfig;
   body: string;
 }
 
@@ -17,7 +19,21 @@ export async function loadTemplate(dir: string, nodeKey: string): Promise<Templa
     node: typeof meta.node === 'string' ? meta.node : nodeKey,
     next: typeof meta.next === 'string' ? meta.next : undefined,
     inputs: Array.isArray(meta.inputs) ? meta.inputs.map(String) : [],
+    budget: parseBudget(meta.budget),
     body,
+  };
+}
+
+function parseBudget(raw: unknown): BudgetConfig {
+  if (!raw || typeof raw !== 'object') return DEFAULT_BUDGET;
+  const b = raw as Record<string, unknown>;
+  return {
+    maxInputTokens:
+      typeof b.max_input_tokens === 'number' ? b.max_input_tokens : DEFAULT_BUDGET.maxInputTokens,
+    maxOutputTokens:
+      typeof b.max_output_tokens === 'number' ? b.max_output_tokens : DEFAULT_BUDGET.maxOutputTokens,
+    maxToolCalls:
+      typeof b.max_tool_calls === 'number' ? b.max_tool_calls : DEFAULT_BUDGET.maxToolCalls,
   };
 }
 
@@ -38,7 +54,6 @@ function parseFrontmatter(raw: string): { meta: Record<string, unknown>; body: s
   }
 }
 
-/** 把 {{issue.title}} 这类占位符替换成运行时上下文 */
 export function renderPrompt(template: Template, context: Record<string, string>): string {
   let out = template.body;
   for (const [k, v] of Object.entries(context)) {

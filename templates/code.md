@@ -4,6 +4,10 @@ next: test
 inputs:
   - issue.title
   - issue.body
+budget:
+  max_input_tokens: 300000
+  max_output_tokens: 80000
+  max_tool_calls: 400
 ---
 
 # 节点：编码实现

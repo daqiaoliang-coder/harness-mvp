@@ -4,6 +4,10 @@ next: ~
 inputs:
   - issue.title
   - issue.body
+budget:
+  max_input_tokens: 150000
+  max_output_tokens: 40000
+  max_tool_calls: 300
 ---
 
 # 节点：测试验证

@@ -312,3 +312,49 @@ npm run dev
 
 ```
 
+
+---
+
+## P0 成本治理与可靠性优化
+
+基于生产环境评测数据（单任务 QA 阶段消耗 3.88 亿 token 最终失败、返工 15 次、
+error/warning 132–412 条），MVP 增加了三项 P0 优化，对应生产系统中从 B 档到 A 档
+的优化路径：
+
+### 1. 上下文预算与裁剪（`packages/shared/src/budget.ts`）
+
+- 节点模板 frontmatter 声明 `budget.max_input_tokens`
+- Gateway 按预算裁剪 context，超预算字段只保留摘要 + 截断标记
+- 后序节点默认不继承前序 transcript 全文
+- **预期收益**：轻量需求 token 消耗降低约 60%
+
+### 2. 熔断与重试策略（`packages/gateway/src/circuit-breaker.ts`）
+
+- 节点模板声明 `retry.max_attempts` / `budget.max_tokens` / `on_exhausted`
+- 超过阈值自动中止流程、打上 `hitl:waiting` 标签、写
+  `circuit_breaker.tripped` 事件
+- 不再无限重试，避免单节点 token 失控
+- **预期收益**：QA 最坏情况 token 消耗降低约 90%
+
+### 3. 前置检查框架（`packages/loop-node/src/preflight.ts`）
+
+- agent 启动前执行凭证 / 网络 / CLI 登录态检查
+- BLOCKER 级别失败直接返回 `run.result failed`，不启动 agent、不消耗 token
+- WARNING 级别失败仅记录日志，不阻塞执行
+- **预期收益**：error/warning 数量降低约 80%
+
+### 验证方式
+
+启动后在 Dashboard 观察：
+
+- 超预算时出现 `run.dispatched` 事件中 context 被裁剪
+- 连续失败时出现 `circuit_breaker.tripped` 事件，issue 被标记 `hitl:waiting`
+- 前置检查失败时 `run.failed` 事件直接在 preflight 阶段产生，无 `run.progress`
+
+### 后续 P1 / P2
+
+- **P1**：HITL 生命周期状态机（`created → notified → acknowledged → resolved`，
+  含超时升级和默认动作）
+- **P1**：环境准备节点去 Agent 化（改为 `type: script`）
+- **P2**：验证闭环（节点执行完自动跑验收断言）
+- **P2**：Token 成本看板（按 project / run / node 聚合）

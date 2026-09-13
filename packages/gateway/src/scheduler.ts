@@ -4,6 +4,7 @@ import type { GatewayConfig } from './config.js';
 import type { EventStore } from './db.js';
 import type { EventBus } from './bus.js';
 import { detectNode, type GithubClient, type Issue } from './github.js';
+import { CircuitBreaker, DEFAULT_RETRY } from './circuit-breaker.js';
 
 export interface WorkerConn {
   nodeId: string;
@@ -28,6 +29,7 @@ interface Deps {
   store: EventStore;
   bus: EventBus;
   github: GithubClient;
+  circuitBreaker: CircuitBreaker;
 }
 
 export class Scheduler {
@@ -35,7 +37,6 @@ export class Scheduler {
   private runsByIssue = new Map<number, Run>();
   private runsByRunId = new Map<string, Run>();
   private timer?: NodeJS.Timeout;
-  private healthTimer?: NodeJS.Timeout;
   private ticking = false;
 
   constructor(private deps: Deps) {}
@@ -46,46 +47,10 @@ export class Scheduler {
         this.timer = setTimeout(loop, this.deps.config.github.pollIntervalMs);
       });
     loop();
-    this.healthTimer = setInterval(
-      () => this.healthCheck(),
-      this.deps.config.worker.pingIntervalMs,
-    );
   }
 
   stop() {
     if (this.timer) clearTimeout(this.timer);
-    if (this.healthTimer) clearInterval(this.healthTimer);
-  }
-
-  /**
-   * worker 健康巡检：
-   *  1. 周期性发应用层 ping，worker 以 heartbeat 回应（同时刷新 lastSeen）；
-   *  2. lastSeen 超时说明进程假死或 TCP 半开——主动 terminate 触发 close，
-   *     close 处理会 unregisterWorker 并释放该 worker 持有的 run 锁，
-   *     下轮 GitHub 轮询即按当前标签重新派发，issue 不会永久卡住。
-   */
-  private healthCheck() {
-    const now = Date.now();
-    for (const w of this.workers.values()) {
-      if (w.socket.readyState !== 1) continue;
-      try {
-        w.socket.send(JSON.stringify({ type: 'ping' } satisfies GatewayToWorker));
-      } catch (e) {
-        console.error('[scheduler] 发送 ping 失败:', (e as Error).message);
-      }
-      if (now - w.lastSeen > this.deps.config.worker.staleMs) {
-        console.warn(
-          `[scheduler] worker=${w.nodeId} 超过 ${this.deps.config.worker.staleMs}ms 无心跳，主动断连`,
-        );
-        this.emit('harness', 'worker.stale', {
-          nodeId: w.nodeId,
-          runId: w.currentRunId,
-          details: { lastSeen: new Date(w.lastSeen).toISOString() },
-        });
-        // terminate 同步标记关闭，close 事件随后触发 unregisterWorker → releaseRun
-        w.socket.terminate();
-      }
-    }
   }
 
   registerWorker(w: WorkerConn) {
@@ -209,98 +174,86 @@ export class Scheduler {
   ) {
     const run = this.runsByRunId.get(runId);
     if (!run) return;
+
+    this.runsByRunId.delete(runId);
+    this.runsByIssue.delete(run.issueNumber);
     run.status = status;
 
     const worker = this.workers.get(run.workerId);
-    const releaseWorker = () => {
-      if (worker) {
-        worker.busy = false;
-        worker.currentRunId = undefined;
-      }
-    };
-    // 锁必须在 GitHub 状态推进成功后才释放：评论/打标期间轮询会看到旧标签，
-    // 提前释放会导致同一节点被重复派发（at-most-once → at-least-once）。
-    const releaseRunLock = () => {
-      this.runsByRunId.delete(runId);
-      this.runsByIssue.delete(run.issueNumber);
-    };
+    if (worker) {
+      worker.busy = false;
+      worker.currentRunId = undefined;
+    }
 
-    try {
-      const issues = await this.deps.github.listIssues();
-      const issue = issues.find((i) => i.number === run.issueNumber);
-      if (!issue) {
-        releaseRunLock();
-        releaseWorker();
-        return;
-      }
+    const issues = await this.deps.github.listIssues();
+    const issue = issues.find((i) => i.number === run.issueNumber);
+    if (!issue) return;
 
-      if (status === 'completed') {
-        const nextIndex = this.deps.config.pipeline.indexOf(run.nodeKey) + 1;
-        const next = this.deps.config.pipeline[nextIndex];
+    if (status === 'completed') {
+      this.deps.circuitBreaker.reset(`${run.issueNumber}:${run.nodeKey}`);
 
-        await this.deps.github.addComment(
-          issue.number,
-          [
-            `### ✅ 节点 \`${run.nodeKey}\` 执行完成`,
-            '',
-            '<details><summary>执行输出（尾部截取）</summary>',
-            '',
-            '```',
-            (output ?? '').slice(-3000),
-            '```',
-            '</details>',
-          ].join('\n'),
-        );
+      const nextIndex = this.deps.config.pipeline.indexOf(run.nodeKey) + 1;
+      const next = this.deps.config.pipeline[nextIndex];
 
-        if (next) {
-          await this.deps.github.setLabels(issue.number, [`node:${next}`]);
-          this.emit('github', 'issue.node.advanced', {
-            workItemId: String(issue.number),
-            runId,
-            details: { from: run.nodeKey, to: next },
-          });
-        } else {
-          await this.deps.github.setLabels(issue.number, ['node:done']);
-          await this.deps.github.addComment(issue.number, '🎉 **流程完成**：所有节点已执行完毕。');
-          await this.deps.github.closeIssue(issue.number);
-          this.emit('github', 'issue.completed', { workItemId: String(issue.number), runId });
-        }
-      } else {
-        await this.deps.github.addComment(
-          issue.number,
-          [
-            `### ❌ 节点 \`${run.nodeKey}\` 执行失败`,
-            '',
-            '```',
-            (error ?? 'unknown error').slice(0, 2000),
-            '```',
-          ].join('\n'),
-        );
-        // 失败后标签保持不变，下轮轮询会按标签重新派发该节点（每次尝试都会通知）
-        this.emit('harness', 'issue.node.failed', {
+      await this.deps.github.addComment(
+        issue.number,
+        [
+          `### ✅ 节点 \`${run.nodeKey}\` 执行完成`,
+          '',
+          '<details><summary>执行输出（尾部截取）</summary>',
+          '',
+          '```',
+          (output ?? '').slice(-3000),
+          '```',
+          '</details>',
+        ].join('\n'),
+      );
+
+      if (next) {
+        await this.deps.github.setLabels(issue.number, [`node:${next}`]);
+        this.emit('github', 'issue.node.advanced', {
           workItemId: String(issue.number),
           runId,
-          nodeId: run.workerId,
-          details: {
-            nodeKey: run.nodeKey,
-            error: (error ?? 'unknown error').slice(0, 1000),
-          },
+          details: { from: run.nodeKey, to: next },
         });
+      } else {
+        await this.deps.github.setLabels(issue.number, ['node:done']);
+        await this.deps.github.addComment(issue.number, '🎉 **流程完成**：所有节点已执行完毕。');
+        this.emit('github', 'issue.completed', { workItemId: String(issue.number), runId });
       }
-      releaseRunLock();
-      releaseWorker();
-    } catch (e) {
-      // GitHub 回写失败（含重试后仍失败）：保留 issue 当前标签，释放锁让后续轮询重新派发该节点
-      console.error('[scheduler] 回写 GitHub 失败，下轮轮询将按标签重试该节点:', (e as Error).message);
-      this.emit('harness', 'run.transition_failed', {
+      return;
+    }
+
+    // ---- P0: 熔断检查 ----
+    const runKey = `${run.issueNumber}:${run.nodeKey}`;
+    const check = this.deps.circuitBreaker.check(runKey, DEFAULT_RETRY);
+
+    if (!check.allowed) {
+      this.emit('harness', 'circuit_breaker.tripped', {
         runId,
         workItemId: String(run.issueNumber),
-        nodeId: run.workerId,
-        details: { error: (e as Error).message.slice(0, 500) },
+        details: { nodeKey: run.nodeKey, reason: check.reason },
       });
-      releaseRunLock();
-      releaseWorker();
+      await this.deps.github.addComment(
+        issue.number,
+        `### 🛑 熔断触发\n\n节点 \`${run.nodeKey}\` 已中止：${check.reason}\n\n需要人工介入。`,
+      );
+      await this.deps.github.setLabels(issue.number, ['hitl:waiting']);
+      return;
     }
+
+    await this.deps.github.addComment(
+      issue.number,
+      [
+        `### ❌ 节点 \`${run.nodeKey}\` 执行失败`,
+        '',
+        '```',
+        (error ?? 'unknown error').slice(0, 2000),
+        '```',
+        '',
+        `_熔断检查通过，剩余重试次数：${DEFAULT_RETRY.maxAttempts - 1}_`,
+      ].join('\n'),
+    );
   }
 
   private releaseRun(runId: string, reason: string) {
