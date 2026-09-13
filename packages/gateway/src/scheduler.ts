@@ -35,6 +35,7 @@ export class Scheduler {
   private runsByIssue = new Map<number, Run>();
   private runsByRunId = new Map<string, Run>();
   private timer?: NodeJS.Timeout;
+  private healthTimer?: NodeJS.Timeout;
   private ticking = false;
 
   constructor(private deps: Deps) {}
@@ -45,10 +46,46 @@ export class Scheduler {
         this.timer = setTimeout(loop, this.deps.config.github.pollIntervalMs);
       });
     loop();
+    this.healthTimer = setInterval(
+      () => this.healthCheck(),
+      this.deps.config.worker.pingIntervalMs,
+    );
   }
 
   stop() {
     if (this.timer) clearTimeout(this.timer);
+    if (this.healthTimer) clearInterval(this.healthTimer);
+  }
+
+  /**
+   * worker 健康巡检：
+   *  1. 周期性发应用层 ping，worker 以 heartbeat 回应（同时刷新 lastSeen）；
+   *  2. lastSeen 超时说明进程假死或 TCP 半开——主动 terminate 触发 close，
+   *     close 处理会 unregisterWorker 并释放该 worker 持有的 run 锁，
+   *     下轮 GitHub 轮询即按当前标签重新派发，issue 不会永久卡住。
+   */
+  private healthCheck() {
+    const now = Date.now();
+    for (const w of this.workers.values()) {
+      if (w.socket.readyState !== 1) continue;
+      try {
+        w.socket.send(JSON.stringify({ type: 'ping' } satisfies GatewayToWorker));
+      } catch (e) {
+        console.error('[scheduler] 发送 ping 失败:', (e as Error).message);
+      }
+      if (now - w.lastSeen > this.deps.config.worker.staleMs) {
+        console.warn(
+          `[scheduler] worker=${w.nodeId} 超过 ${this.deps.config.worker.staleMs}ms 无心跳，主动断连`,
+        );
+        this.emit('harness', 'worker.stale', {
+          nodeId: w.nodeId,
+          runId: w.currentRunId,
+          details: { lastSeen: new Date(w.lastSeen).toISOString() },
+        });
+        // terminate 同步标记关闭，close 事件随后触发 unregisterWorker → releaseRun
+        w.socket.terminate();
+      }
+    }
   }
 
   registerWorker(w: WorkerConn) {
@@ -239,6 +276,16 @@ export class Scheduler {
             '```',
           ].join('\n'),
         );
+        // 失败后标签保持不变，下轮轮询会按标签重新派发该节点（每次尝试都会通知）
+        this.emit('harness', 'issue.node.failed', {
+          workItemId: String(issue.number),
+          runId,
+          nodeId: run.workerId,
+          details: {
+            nodeKey: run.nodeKey,
+            error: (error ?? 'unknown error').slice(0, 1000),
+          },
+        });
       }
       releaseRunLock();
       releaseWorker();

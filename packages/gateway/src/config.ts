@@ -14,6 +14,18 @@ export interface GatewayConfig {
     repo?: string;
     pollIntervalMs: number;
   };
+  worker: {
+    /** 给在线 worker 发应用层 ping 的间隔 */
+    pingIntervalMs: number;
+    /** 多久收不到 worker 任何消息（heartbeat/progress）就判定假死并断连释放 run 锁 */
+    staleMs: number;
+  };
+  /** 飞书通知（方案 A：群自定义机器人 webhook；留空则关闭通知） */
+  feishu: {
+    webhookUrl?: string;
+    /** 机器人启用了「签名校验」时对应的加签密钥 */
+    webhookSecret?: string;
+  };
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +53,14 @@ export function loadConfig(): GatewayConfig {
       owner: process.env.GITHUB_OWNER,
       repo: process.env.GITHUB_REPO,
       pollIntervalMs: Number(process.env.GITHUB_POLL_MS ?? 5000),
+    },
+    worker: {
+      pingIntervalMs: Number(process.env.WORKER_PING_MS ?? 15_000),
+      staleMs: Number(process.env.WORKER_STALE_MS ?? 45_000),
+    },
+    feishu: {
+      webhookUrl: process.env.FEISHU_WEBHOOK_URL || undefined,
+      webhookSecret: process.env.FEISHU_WEBHOOK_SECRET || undefined,
     },
   };
 }

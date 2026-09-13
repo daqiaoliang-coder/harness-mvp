@@ -11,7 +11,7 @@ export interface RunAgentOptions {
 
 export interface AgentHandle {
   write: (data: string) => void;
-  kill: () => void;
+  kill: (signal?: string) => void;
 }
 
 /**
@@ -22,7 +22,7 @@ export interface AgentHandle {
  *  - 走 PTY 才能保留工具调用、权限提示、会话管理这些能力
  *  - agent 自己的 resume 命令依赖本地 transcript，必须让它以为在真实终端里
  *
- * 回退到 spawn 时链路仍然可用，但会丢失 TTY 特性。
+ * 回退到 spawn 时链路仍然可用，但会丢失 TTY 能力。
  */
 let ptyModule: typeof import('node-pty') | null = null;
 try {
@@ -36,6 +36,7 @@ try {
 
 export function runAgent(opts: RunAgentOptions): AgentHandle {
   if (ptyModule) {
+    // node-pty 的 spawn 失败（如命令不存在）会同步抛出，由调用方 try/catch。
     const proc = ptyModule.spawn(opts.cmd, opts.args, {
       name: 'xterm-256color',
       cols: 200,
@@ -43,13 +44,19 @@ export function runAgent(opts: RunAgentOptions): AgentHandle {
       cwd: opts.cwd,
       env: opts.env as Record<string, string>,
     });
+    let exited = false;
+    const emitExit = (code: number) => {
+      if (exited) return;
+      exited = true;
+      opts.onExit(code);
+    };
     proc.onData(opts.onData);
-    proc.onExit(({ exitCode }) => opts.onExit(exitCode));
+    proc.onExit(({ exitCode }) => emitExit(exitCode));
     return {
       write: (data) => proc.write(data),
-      kill: () => {
+      kill: (signal) => {
         try {
-          proc.kill();
+          proc.kill(signal as never);
         } catch {
           /* ignore */
         }
@@ -61,16 +68,28 @@ export function runAgent(opts: RunAgentOptions): AgentHandle {
     cwd: opts.cwd,
     env: opts.env as NodeJS.ProcessEnv,
   });
+  let exited = false;
+  const emitExit = (code: number) => {
+    if (exited) return;
+    exited = true;
+    opts.onExit(code);
+  };
   proc.stdout?.on('data', (d: Buffer) => opts.onData(d.toString()));
   proc.stderr?.on('data', (d: Buffer) => opts.onData(d.toString()));
-  proc.on('exit', (code: number | null) => opts.onExit(code ?? 0));
+  // 命令不存在 / 无执行权限等：error 事件无人监听会升级为 uncaughtException。
+  // 统一按非零退出码上报，让 scheduler 走失败分支而不是拖死整个 node。
+  proc.on('error', (err) => {
+    console.error('[loop-node] agent 进程错误:', err.message);
+    emitExit(127);
+  });
+  proc.on('exit', (code: number | null) => emitExit(code ?? 0));
   return {
     write: (data) => {
       proc.stdin?.write(data);
     },
-    kill: () => {
+    kill: (signal) => {
       try {
-        proc.kill();
+        proc.kill(signal as NodeJS.Signals);
       } catch {
         /* ignore */
       }

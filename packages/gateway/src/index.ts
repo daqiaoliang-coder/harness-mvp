@@ -5,6 +5,7 @@ import { createGithubClient } from './github.js';
 import { Scheduler } from './scheduler.js';
 import { createHttpApp } from './http.js';
 import { attachWebSocketServer } from './ws.js';
+import { startFeishuNotifier } from './notifier.js';
 
 const config = loadConfig();
 const store = new EventStore(config.dbPath);
@@ -37,10 +38,12 @@ server.once('listening', () => {
 });
 
 const wss = attachWebSocketServer({ server, config, store, bus, scheduler });
+const stopNotifier = startFeishuNotifier({ config, bus });
 scheduler.start();
 
 const shutdown = () => {
   console.log('\n[gateway] 关闭中...');
+  stopNotifier();
   scheduler.stop();
   wss.close();
   server.close(() => process.exit(0));

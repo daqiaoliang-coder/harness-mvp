@@ -9,6 +9,9 @@
 #   security add-generic-password -a "$USER" -s harness-github-token -w
 #   security add-generic-password -a "$USER" -s harness-doubao-api-key -w
 # 换 provider 时把 doubao 换成对应名字：anthropic / openai / google / openrouter 等。
+# 可选的飞书群机器人 webhook（含加签 secret）：
+#   security add-generic-password -a "$USER" -s harness-feishu-webhook -w
+#   security add-generic-password -a "$USER" -s harness-feishu-webhook-secret -w
 # 首次读取时 macOS 会弹一次授权框，点「始终允许」后不再提示。
 #
 # 临时覆盖单次运行，仍可直接 export：
@@ -50,7 +53,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
   key="${line%%=*}"
   case "$key" in
-    GITHUB_TOKEN | *_API_KEY) continue ;;
+    GITHUB_TOKEN | *_API_KEY | FEISHU_WEBHOOK_URL | FEISHU_WEBHOOK_SECRET) continue ;;
   esac
   if [[ -z "${!key+x}" ]]; then
     export "${line?}"
@@ -89,6 +92,10 @@ TRAE_PROVIDER_RESOLVED="${TRAE_PROVIDER:-$(env_file_value TRAE_PROVIDER)}"
 TRAE_PROVIDER_RESOLVED="${TRAE_PROVIDER_RESOLVED:-doubao}"
 MODEL_KEY_VAR="$(printf '%s' "$TRAE_PROVIDER_RESOLVED" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9_' '_')_API_KEY"
 resolve_secret "$MODEL_KEY_VAR" "harness-$(provider_slug "$TRAE_PROVIDER_RESOLVED")-api-key"
+
+# 飞书通知为可选项：未配置也照常启动，只是 gateway 关闭卡片推送
+resolve_secret FEISHU_WEBHOOK_URL harness-feishu-webhook
+resolve_secret FEISHU_WEBHOOK_SECRET harness-feishu-webhook-secret
 
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
   cat >&2 <<'EOF'
@@ -195,5 +202,10 @@ fi
 # harness 会把 prompt 文件路径作为最后一个参数追加给 AGENT_CMD
 export AGENT_CMD="$REPO_ROOT/scripts/trae-prompt-runner.sh"
 
-echo "[dev-real] github=${GITHUB_OWNER}/${GITHUB_REPO} (${GITHUB_MODE})  agent=trae-cli (${TRAE_PROVIDER_RESOLVED}/${TRAE_MODEL:-doubao-seed-1.6})"
+if [[ -n "${FEISHU_WEBHOOK_URL:-}" ]]; then
+  feishu_status="on${FEISHU_WEBHOOK_SECRET:+（加签）}"
+else
+  feishu_status="off"
+fi
+echo "[dev-real] github=${GITHUB_OWNER}/${GITHUB_REPO} (${GITHUB_MODE})  agent=trae-cli (${TRAE_PROVIDER_RESOLVED}/${TRAE_MODEL:-doubao-seed-1.6})  feishu=${feishu_status}"
 exec npm run dev
