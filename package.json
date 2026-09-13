@@ -12,7 +12,10 @@
     "start:node": "npm --workspace @harness/loop-node run start",
     "test": "tsx --test packages/*/src/**/*.test.ts",
     "test:gw": "tsx --test packages/gateway/src/*.test.ts",
-    "test:shared": "tsx --test packages/shared/src/*.test.ts"
+    "test:shared": "tsx --test packages/shared/src/*.test.ts",
+    "test:node": "tsx --test packages/loop-node/src/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

@@ -30,7 +30,22 @@ function numberEnv(name: string, defaultValue: number): number {
 export function loadConfig(): LoopNodeConfig {
   const defaultMockAgent = path.resolve(repoRoot, 'scripts/mock-agent.mjs');
   const agentCmd = process.env.AGENT_CMD ?? process.execPath;
-  const agentArgsRaw = process.env.AGENTS ?? defaultMockAgent;
+
+  /**
+   * AGENT_ARGS 专用于「传给 agent 命令的参数」，缺省回退到内置 mock agent。
+   *
+   * 为什么不能复用 AGENTS：这两个变量语义完全不同 ——
+   *   AGENTS      = 向 Gateway 声明本节点可用的 agent 列表（hello 消息用）
+   *   AGENT_ARGS  = 启动 agent 进程时附加的命令行参数
+   * 此前实现用 AGENTS 兼作 agentArgs，导致 mock 模式（AGENTS=mock）下
+   * 实际执行的是 `node mock <promptFile>`，posix_spawnp 直接失败 ——
+   * 每个 run 都以「agent 启动失败」告终，重试耗尽后熔断转 HITL，
+   * 所谓「mock 模式零配置开箱即用」根本跑不通。
+   *
+   * 回退值必须是绝对路径：loop-node 的 cwd 是 packages/loop-node，
+   * 相对路径 scripts/mock-agent.mjs 在该 cwd 下解析不到。
+   */
+  const agentArgsRaw = process.env.AGENT_ARGS ?? defaultMockAgent;
 
   return {
     gatewayUrl: process.env.GATEWAY_URL ?? 'ws://localhost:8787/ws',

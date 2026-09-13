@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export interface RunAgentOptions {
   cmd: string;
@@ -15,6 +18,59 @@ export interface AgentHandle {
 }
 
 /**
+ * 修复 node-pty 预编译 spawn-helper 缺失可执行位的问题。
+ *
+ * 为什么必须自愈：某些环境下 npm 解包会丢掉该文件的可执行位，表现为
+ * agent 启动时 `posix_spawnp failed` —— 每个 run 都失败，重试耗尽后熔断
+ * 转 HITL。错误信息只说 spawn 失败、不指向权限，极难定位。
+ *
+ * 为什么放在运行时而不是只留在 dev-real.sh：README 的快速开始是
+ * `npm install && npm run dev`，根本不经过那个脚本，照文档操作必然踩坑。
+ * 自愈属于「让系统在自己能力范围内恢复」，不该依赖使用者记住额外步骤。
+ *
+ * 失败不致命：定位不到文件或无写权限时只 warn；PTY 若真起不来，
+ * 仍由 handleLaunch 按失败 run 上报，不会静默挂住。
+ */
+function ensureSpawnHelperExecutable() {
+  // win32 走 conpty，没有 posix spawn-helper，无需处理
+  if (process.platform === 'win32') return;
+
+  const platform = process.platform.toLowerCase();
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  const rel = path.join('node_modules/node-pty/prebuilds', `${platform}-${arch}`, 'spawn-helper');
+
+  // 从本模块逐级向上找 node_modules：monorepo 下依赖可能被提升到仓库根
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    const helper = path.join(dir, rel);
+
+    if (fs.existsSync(helper)) {
+      try {
+        fs.accessSync(helper, fs.constants.X_OK);
+        return; // 已有可执行位，无需修复
+      } catch {
+        /* 落到下面的 chmod */
+      }
+      try {
+        fs.chmodSync(helper, 0o755);
+        console.warn(
+          `[loop-node] 已自动修复 node-pty spawn-helper 可执行位（原缺失会导致 posix_spawnp failed）: ${helper}`,
+        );
+      } catch (e) {
+        console.warn(
+          `[loop-node] 无法修复 spawn-helper 可执行位，PTY 启动可能失败: ${(e as Error).message}`,
+        );
+      }
+      return;
+    }
+
+    const parent = path.dirname(dir);
+    if (parent === dir) return; // 已到文件系统根，仍未找到
+    dir = parent;
+  }
+}
+
+/**
  * 优先使用 node-pty。若原生模块不可用，回退到 child_process.spawn。
  *
  * 为什么首选 PTY：
@@ -26,6 +82,7 @@ export interface AgentHandle {
  */
 let ptyModule: typeof import('node-pty') | null = null;
 try {
+  ensureSpawnHelperExecutable();
   ptyModule = await import('node-pty');
 } catch {
   console.warn(

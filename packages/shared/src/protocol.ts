@@ -20,6 +20,37 @@ export interface HarnessEvent {
   details?: Record<string, unknown>;
 }
 
+/**
+ * 节点级重试与熔断策略。
+ *
+ * 定义在 shared 而非 gateway：策略由业务模板（templates/*.md）声明，
+ * 模板由执行面加载——而架构边界要求 Gateway 不读模板内容、不理解业务语义。
+ * 因此执行面解析模板后，必须随 run.result 把策略回报给控制面，
+ * 控制面才有依据做熔断判定。类型放 shared 是为了两侧口径一致。
+ */
+export interface RetryPolicy {
+  /** 最大失败尝试次数；第 N 次失败即触发熔断 */
+  maxAttempts: number;
+  /** 累计注入 token 上限，超过即熔断 */
+  maxTokens: number;
+  /** 单节点最长执行时间（ms），超过即熔断 */
+  maxDurationMs: number;
+  /** 熔断后的处置：转人工卡点 / 直接失败 / 跳过该节点 */
+  onExhausted: 'hitl' | 'fail' | 'skip';
+}
+
+/**
+ * 默认策略：仅当模板未声明 retry 段时兜底。
+ * 模板声明优先——业务方按节点风险自行决定重试预算（如 QA 节点容忍更多次）。
+ * 放在 shared 是因为执行面解析模板时也要用它兜底，而执行面不能反向依赖控制面。
+ */
+export const DEFAULT_RETRY: RetryPolicy = {
+  maxAttempts: 3,
+  maxTokens: 5_000_000,
+  maxDurationMs: 3_600_000,
+  onExhausted: 'hitl',
+};
+
 /** Worker → Gateway */
 export type WorkerToGateway =
   | { type: 'hello'; nodeId: string; token: string; agents: string[]; version: string }
@@ -31,6 +62,13 @@ export type WorkerToGateway =
       status: 'completed' | 'failed';
       output?: string;
       error?: string;
+      /**
+       * 本次执行的节点模板所声明的重试策略。
+       * 由执行面解析模板 frontmatter 后回报，控制面据此替代全局默认值做熔断判定。
+       */
+      retry?: RetryPolicy;
+      /** 前置检查结果摘要，便于控制面区分「环境问题」与「业务失败」。 */
+      preflight?: { passed: boolean; failed: string[] };
     };
 
 /** Gateway → Worker */

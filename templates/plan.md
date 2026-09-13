@@ -8,6 +8,12 @@ budget:
   max_input_tokens: 200000
   max_output_tokens: 50000
   max_tool_calls: 200
+retry:
+  max_attempts: 2
+  max_tokens: 4000000
+  max_duration_ms: 1800000
+  on_exhausted: hitl
+
 ---
 
 # 节点：技术方案

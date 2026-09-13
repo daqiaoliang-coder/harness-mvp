@@ -1,16 +1,9 @@
-export interface RetryPolicy {
-  maxAttempts: number;
-  maxTokens: number;
-  maxDurationMs: number;
-  onExhausted: 'hitl' | 'fail' | 'skip';
-}
+import { DEFAULT_RETRY, type RetryPolicy } from '@harness/shared';
 
-export const DEFAULT_RETRY: RetryPolicy = {
-  maxAttempts: 3,
-  maxTokens: 5_000_000,
-  maxDurationMs: 3_600_000,
-  onExhausted: 'hitl',
-};
+// 默认策略与策略类型均以 shared 为唯一事实源，此处仅做转发，
+// 使既有 import { DEFAULT_RETRY } from './circuit-breaker.js' 的调用方无需改动。
+export { DEFAULT_RETRY };
+export type { RetryPolicy };
 
 interface RunAttempt {
   attempt: number;

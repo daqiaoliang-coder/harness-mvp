@@ -27,11 +27,56 @@ const server = app.listen(config.httpPort, () => {
 const wss = attachWebSocketServer({ server, config, store, bus, scheduler });
 scheduler.start();
 
-const shutdown = () => {
-  console.log('\n[gateway] 关闭中...');
+/**
+ * 跟踪所有活动连接（WS worker + SSE 看板 + 普通 HTTP）。
+ *
+ * 为什么必须自己跟踪：server.close() 只是「停止接受新连接」，
+ * 它不会断开已经建立的长连接。而本服务恰恰以长连接为主 ——
+ * worker 常驻 WS、看板常驻 SSE（还各带一个 15s keepalive 定时器）。
+ * 只要有任一客户端连着，close 的回调就永不触发，process.exit 永不调用：
+ * SIGTERM 只打印「关闭中...」然后进程挂住，Ctrl+C 退出 npm run dev
+ * 会留下僵尸 gateway 继续占着端口。
+ *
+ * 在 connection 事件统一收集即可覆盖全部三类：WS 是 HTTP 升级而来，
+ * SSE 是普通 HTTP 长响应，底层都是同一个 net.Socket。
+ */
+const sockets = new Set<import('node:net').Socket>();
+server.on('connection', (socket) => {
+  sockets.add(socket);
+  socket.on('close', () => sockets.delete(socket));
+});
+
+/** 强制退出的最后兜底：销毁连接仍未能退出时，不无限期挂住。 */
+const HARD_EXIT_MS = 3_000;
+
+let shuttingDown = false;
+const shutdown = (signal: string) => {
+  // 幂等：SIGINT 连按两次、或 SIGTERM 与 SIGINT 相继到达时只关停一次
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`\n[gateway] 收到 ${signal}，关闭中...`);
+
+  // 1. 停调度与健康检查，不再派发新任务
   scheduler.stop();
+
+  // 2. 主动断开所有长连接。terminate/destroy 是立即的，不等对端握手
+  for (const client of wss.clients) client.terminate();
   wss.close();
+  for (const socket of sockets) socket.destroy();
+  sockets.clear();
+
+  // 3. 关闭 HTTP 服务；正常情况下此时已无连接，回调会立即触发
   server.close(() => process.exit(0));
+
+  // 4. 兜底：若仍有连接未释放（如 keepalive 定时器持有引用），强制退出
+  const hardExit = setTimeout(() => {
+    console.error(`[gateway] 关停超过 ${HARD_EXIT_MS}ms 仍未完成，强制退出`);
+    process.exit(1);
+  }, HARD_EXIT_MS);
+  // unref：该定时器不应阻止进程自然退出
+  hardExit.unref();
 };
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

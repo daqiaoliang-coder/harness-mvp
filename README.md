@@ -155,15 +155,31 @@ Gateway **不设内部队列**：派发时刻没有空闲 worker，issue 既不�
 
 #### 锁持有者死亡回收：ping / stale / terminate
 
-执行 PTY 的 worker 可能进程假死或 TCP 半开：
+执行 PTY 的 worker 可能进程假死或 TCP 半开。这两种情况下 FIN/RST 都不会到达，
+socket 的 readyState 长期停在 OPEN，`close` 回调永不触发 ——
+`unregisterWorker` 不被调用，该 worker 持有的 issue 去重锁就**永久占住**，
+需求静默卡死且无任何告警。因此不能只依赖 `close` 事件，必须应用层探活：
 
 - Scheduler 每 `WORKER_PING_MS`（默认 15s）给每个在线 worker 发应用层 `ping`；
   worker 的任意消息（heartbeat 或 progress）都会刷新 `lastSeen`；
 - 超过 `WORKER_STALE_MS`（默认 45s）没消息即判定死亡：先记录 `worker.stale`
-  事件，再 `socket.terminate()`；随后的 `close` 回调走 `unregisterWorker`
+  事件（带 `lastSeenAgoMs` 与被中断的 `currentRunId`，便于归因），再
+  `socket.terminate()`；随后的 `close` 回调走 `unregisterWorker`
   → `releaseRun('worker_lost')` 同步摘除两个 Map 中的锁；
 - 下轮轮询看到 issue 仍是旧标签，重新派发该节点。
   锁随连接生命周期绑定，死亡连接不会把 issue 永久锁死。
+- 健康检查用独立定时器，不搭业务轮询的便车：两者周期不同，
+  且 `tick` 可能因 GitHub 慢而延长。`pingIntervalMs = 0` 可禁用。
+- `staleMs` 必须显著大于 `pingIntervalMs`（默认 45s vs 15s，即 3 次机会），
+  否则一次网络抖动就会误杀健康 worker。
+- 单个 worker 的 `send` / `terminate` 抛错只记录，不中断本轮对其余 worker 的巡检。
+
+**执行面必须有对称回收**：Gateway 侧 terminate 之后，worker 侧若不做对应处理，
+就会出现「Gateway 已释放锁并重派、本地旧 agent 仍在跑」的并发踩踏 ——
+两个 agent 读写同一工作目录/同一仓库分支，产出不报错地互相覆盖。
+对称动作（指数退避重连、TCP 半开自检、断连即孤儿化强杀、启动期间断连竞态、
+`hello.reject` 不退出、进程级优雅退出）详见下文
+[loop-node：核心设计 §1](#1-主动外连退避重连自身无状态)。
 
 #### 存储与广播侧的并发保证
 
@@ -180,19 +196,26 @@ Gateway **不设内部队列**：派发时刻没有空闲 worker，issue 既不�
 
 #### 已知并发窗口与边界（诚实清单）
 
-- **`busy` 双写窄窗**：gateway 发 `launch` 后，worker 在模板加载、prompt 落盘
-  完成后才登记 `activeRuns`；若恰在此窗口收到 ping，heartbeat 回报 `load=0`
-  会把 gateway 侧的 `busy` 覆写为 false，理论上同一 worker 可再接一个 run
-  （issue 去重锁仍保证两个 run 一定是不同 issue）。15s 的 ping 间隔对毫秒级的
-  launch 处理使窗口几乎不可命中；要彻底收敛，可让 `busy` 以 launch/result
-  为唯一权威，heartbeat 只刷新 `lastSeen`。
+- **`busy` 双写窄窗（已收敛）**：此前 heartbeat 用 `load > 0` 覆写 `busy`，
+  存在一个窄窗 —— gateway 发出 `launch` 后，worker 要等模板加载、prompt 落盘
+  完成才登记 `activeRuns`；若恰在此窗口收到 ping，回报 `load=0` 会把 gateway 侧的
+  `busy` 抹成 false，同一 worker 可能被派发第二个 run，两个 agent 并发踩同一工作目录。
+  该窗口此前不可达（gateway 从不发 ping），健康检查上线后 ping 每 15s 一次，
+  窗口变成真实风险，因此按文档建议的方案收敛：**`busy` 以 launch/result 为唯一权威，
+  heartbeat 只刷新 `lastSeen`，负载记入 `lastLoad` 仅供观测**。
 - **回写途中 worker 断线**：`onRunResult` 持有 run 的本地引用继续 GitHub 回写，
   但锁可能已被 `worker_lost` 摘除——这正是 at-least-once 重派窗口，
   靠节点幂等消化。
-- **优雅退出不等待在途回写**：`shutdown` 只停 timer、关连接，不等待数秒级的
-  GitHub 回写完成；中途退出同样靠重启后标签重放收敛。
+- **优雅退出不等待在途回写**：`shutdown` 会停调度与健康检查、销毁全部长连接，
+  但不等待数秒级的 GitHub 回写完成；中途退出同样靠重启后标签重放收敛。
+  （长连接必须主动销毁：`server.close()` 只停止接受新连接，不会断开已建立的
+  WS/SSE，否则回调永不触发、`process.exit` 永不调用，进程会挂住并继续占端口。
+  另有 3s 硬超时兜底强制退出。）
 - **仅单 Gateway 实例成立**：`ticking`、内存 Map 都是进程内机制，没有选主、
   分布式锁或 fencing token；两个 Gateway 轮同一仓库会重复派发。
+- **stop 与在途 tick 的竞态**：`tick()` 内含 `await`，若 `stop()` 恰在其间被调用，
+  它清掉的是上一轮的 timer，而 `finally` 会在之后又排一个永不清除的新 timer，
+  事件循环因此常驻、进程退不出去。故以 `stopped` 标志位在 `finally` 中拒绝重排。
 
 ## loop-node（worker）：核心设计
 
@@ -212,8 +235,18 @@ loop-node 是无状态执行面：启动即连 Gateway，收 `launch` →
 - **断连即孤儿化 + 强杀在跑 run**：连接关闭时所有在跑 agent 一律
   `SIGKILL`（`orphanAllRuns`）。因为 Gateway 侧已按 `worker_lost`
   释放锁，重连后可能有另一个 run 接手同一 issue，放任旧 agent 存活只会
-  并发踩同一工作目录；孤儿 run 后续的退出事件也不再上报，重派完全由
+  并发踩同一工作目录；孤儿 run 记入 `orphanedRuns`，其后续退出事件
+  **不再上报**（Gateway 早已释放该 run 的锁，此时上报轻则是噪声，
+  重则误清接手同一 issue 的新 run 的锁），重派完全由
   Gateway 按 GitHub 标签驱动（at-least-once）。
+- **启动期间断连的竞态**：`handleLaunch` 是 async —— preflight 检查、模板加载、
+  prompt 落盘都要 await。若断连恰好发生在这期间，`orphanAllRuns` 遍历
+  `activeRuns` 时还看不到本 run（尚未登记），随后 `set` 进去就留下一个
+  「连接已断、却仍在跑」的 agent。因此登记前复查连接状态，已断则立即强杀。
+- **进程级优雅退出**：loop-node 是 agent 的父进程，PTY 子进程不会随父进程自动
+  终止。收到 SIGINT/SIGTERM 时先停半开定时器、强杀全部在跑 run、再关连接，
+  避免留下脱离管理的 agent 继续读写工作目录。不等待 agent 自行收尾
+  （它可能正卡在长推理里，等待会让关停无限期挂住），残留由 Gateway 按标签重派。
 - **进程级异常兜底**：`unhandledRejection` / `uncaughtException` 只记录不退出，
   一次偶发错误不会拖垮长驻的执行节点。
 - worker 不持久化任何任务状态。重连后是否有活干、干什么，完全由 Gateway
@@ -249,9 +282,15 @@ loop-node 是无状态执行面：启动即连 Gateway，收 `launch` →
   默认 mock 模式下二者均未设置，回退到 `node scripts/mock-agent.mjs`；
   真实模式由 `scripts/dev-real.sh` 把 `AGENT_CMD` 指到
   `scripts/trae-prompt-runner.sh`，亦可换 Claude Code / Codex。
-  注意：`.env.example` 中示例的 `AGENT_ARGS` 当前**不被代码读取**
-  （[config.ts:33](packages/loop-node/src/config.ts#L33) 读的是 `AGENTS`），
-  配置时以代码为准。
+  注意两个变量语义不同，不可混用：
+  `AGENTS` = 向 Gateway 声明本节点可用的 agent 列表（`hello` 消息用）；
+  `AGENT_ARGS` = 启动 agent 进程时附加的命令行参数（缺省回退到内置 mock agent 的绝对路径）。
+- **spawn-helper 权限自愈**：某些环境下 npm 解包会丢掉 node-pty 预编译
+  `spawn-helper` 的可执行位，表现为 agent 启动时 `posix_spawnp failed` ——
+  每个 run 都失败、重试耗尽后熔断转 HITL，而错误信息只说 spawn 失败、不指向权限，
+  极难定位。此前自愈逻辑只在 `dev-real.sh` 里，而 README 的快速开始是
+  `npm install && npm run dev`，根本不经过那个脚本，照文档操作必然踩坑。
+  现已内建到运行时（`pty.ts` 加载 node-pty 前从本模块逐级向上查找并补 `0o755`）。
 - **启动前各失败点都回失败结果**：模板加载失败、工作目录/prompt 落盘失败、
   agent 进程启动失败，都会直接回 `run.result: failed` 并附中文错误原因，
   不会让 launch 静默挂起或变成未处理异常。
@@ -263,6 +302,28 @@ loop-node 是无状态执行面：启动即连 Gateway，收 `launch` →
 - 流水线顺序唯一以 Gateway 的 `PIPELINE`（默认 `plan,code,test`）为准；
   模板 frontmatter 里的 `next / inputs` 目前是**声明性元数据**，不参与调度，
   避免引擎和模板各持一份状态机导致分叉。
+- **`budget` 与 `retry` 由模板声明、引擎只负责解析执行**：
+
+  | frontmatter | 含义 | 生效位置 |
+  | --- | --- | --- |
+  | `budget.max_input_tokens` / `max_output_tokens` / `max_tool_calls` | 上下文预算 | 执行面 `pruneContext` 裁剪 |
+  | `retry.max_attempts` / `max_tokens` / `max_duration_ms` | 熔断阈值 | 控制面 `CircuitBreaker` |
+  | `retry.on_exhausted` | 熔断后处置：`hitl` / `fail` / `skip` | 控制面分流 |
+
+  按节点风险差异化配置：`plan` 2 次即转人工（方案错了后面全错，重试价值低）、
+  `code` 3 次（编码失败常因偶发的网络/工具鉴权）、`test` 2 次但 token 上限放到
+  3000 万（QA 是生产实测的成本黑洞，单任务曾烧掉 3.88 亿 token）。
+
+  **策略必须由执行面回报给控制面**：架构边界要求 Gateway 不读模板内容，
+  而模板由 loop-node 加载 —— 所以 `retry` 随 `run.result` 一起回传，
+  这是策略唯一的传递通道。类型定义放在 `shared` 让两侧口径一致。
+  若这条链路断了（字段没透传），控制面会静默退回全局默认值：
+  测试仍然全绿，但节点声明的更严预算完全失效。
+- **解析必须逐字段防御**：模板由业务方手写、不在编译期检查范围内。
+  一个拼错的字段名（`max_attempt` 少个 s）会让 `policy.maxAttempts` 变成
+  `undefined`，控制面 `attempt >= undefined` 恒为 false —— **熔断静默失效，
+  节点无限重跑烧 token，且全程无报错**。因此非法值一律回退默认值而非透传，
+  `on_exhausted` 只接受枚举内的值。
 
 ### 5. 流式上报、有界缓冲、超时与取消
 
@@ -353,37 +414,63 @@ cp .env.example .env       # 必需：脚本启动时直接读取 .env
 
 基于生产环境评测数据（单任务 QA 阶段消耗 3.88 亿 token 最终失败、返工 15 次、
 error/warning 132–412 条），MVP 增加了三项 P0 优化，对应生产系统中从 B 档到 A 档
-的优化路径：
+的优化路径。
+
+> ⚠️ **下文三处「预期收益」均为设计目标，尚未实测。**
+> 要拿到真实数字需做 A/B：同一需求分别在「裁剪前 / 裁剪后」跑一遍并统计 token，
+> 或从 `recorded_events` 聚合 `run.dispatched` 的 `inputTokens` 做前后对比。
+> 未经实测不要把这些百分比当作已达成的成果引用。
 
 ### 1. 上下文预算与裁剪（`packages/shared/src/budget.ts`）
 
-- 节点模板 frontmatter 声明 `budget.max_input_tokens`
-- Gateway 按预算裁剪 context，超预算字段只保留摘要 + 截断标记
-- 后序节点默认不继承前序 transcript 全文
-- **预期收益**：轻量需求 token 消耗降低约 60%
+- 节点模板 frontmatter 声明 `budget.max_input_tokens` 等三项
+- **裁剪发生在执行面**（`loop-node` 收到 `launch` 后调 `pruneContext`），
+  不在 Gateway —— Gateway 只用同一个 `estimateTokens` 估算本次注入量，
+  供熔断的 token 维度记账。两侧共用同一折算函数，口径一致。
+- 三段式策略：预算内原样透传 → 余量不足时二分求「头部 + 截断标记」不超余量的
+  最大前缀 → 余量耗尽只留一行占位符**且不计入总量**（否则字段一多，
+  累计的标记文本本身就能把预算撑爆）。硬保证注入量 ≤ `max_input_tokens`。
+- MVP 中节点间**不传递任何 transcript**：context 只有 issue 的
+  number/title/body/labels 四项，跨节点结果依赖外部平台字段而非会话历史。
+- **预期收益（未实测）**：轻量需求 token 消耗降低约 60%
 
 ### 2. 熔断与重试策略（`packages/gateway/src/circuit-breaker.ts`）
 
-- 节点模板声明 `retry.max_attempts` / `budget.max_tokens` / `on_exhausted`
-- 超过阈值自动中止流程、打上 `hitl:waiting` 标签、写
-  `circuit_breaker.tripped` 事件
-- 不再无限重试，避免单节点 token 失控
-- **预期收益**：QA 最坏情况 token 消耗降低约 90%
+- 节点模板声明 `retry.max_attempts` / `max_tokens` / `max_duration_ms` / `on_exhausted`，
+  由执行面解析后随 `run.result` 回报，控制面据此判定（详见 §4）
+- 三维触发：重试次数、累计注入 token、单节点最长执行时间
+- 熔断后按 `on_exhausted` 分流：`hitl`（默认，打 `hitl:waiting` 挂起等人工放行）/
+  `fail`（打 `node:failed` 终止流程）/ `skip`（跳过该节点继续推进）
+- 挂起标签会让 `detectNode` 判定 `suspended`，调度不再派发该 issue ——
+  否则会出现「失败 → 熔断 → 重跑」的无限循环，持续烧 token，
+  恰好抵消熔断本身的价值
+- **预期收益（未实测）**：QA 最坏情况 token 消耗降低约 90%
 
 ### 3. 前置检查框架（`packages/loop-node/src/preflight.ts`）
 
-- agent 启动前执行凭证 / 网络 / CLI 登录态检查
-- BLOCKER 级别失败直接返回 `run.result failed`，不启动 agent、不消耗 token
-- WARNING 级别失败仅记录日志，不阻塞执行
-- **预期收益**：error/warning 数量降低约 80%
+- **基础检查恒定启用**（BLOCKER 级）：`git --version`、`node --version`、
+  GitHub API 网络可达性
+- **加固检查按部署声明，默认关闭**（环境变量驱动，未声明则不检查）：
+  `PREFLIGHT_ENV_VARS` 凭证有效性、`PREFLIGHT_GIT_REMOTE` 仓库访问权限
+  （一次验证凭证 + 可达 + 读权限）、`PREFLIGHT_AGENT_LOGIN_CHECK` agent CLI 登录态
+- BLOCKER 级失败直接返回 `run.result failed`，不启动 agent、不消耗 token；
+  WARNING 级失败仅记录日志，不阻塞执行
+- 检查项一律以 **argv 形式**（`execFile`）执行而非 shell 字符串：
+  仓库 URL、登录态命令都来自环境变量，经 shell 拼接会有命令注入面
+- **预期收益（未实测）**：error/warning 数量降低约 80%
 
 ### 验证方式
 
-启动后在 Dashboard 观察：
-
-- 超预算时出现 `run.dispatched` 事件中 context 被裁剪
-- 连续失败时出现 `circuit_breaker.tripped` 事件，issue 被标记 `hitl:waiting`
-- 前置检查失败时 `run.failed` 事件直接在 preflight 阶段产生，无 `run.progress`
+- **上下文裁剪**：看 `loop-node` 日志 `⚠️ 上下文超预算，已截断字段: ...；已省略字段: ...`。
+  注意 `run.dispatched` 事件里的 `context` 是**裁剪前的完整内容**
+  （裁剪在执行面收到 launch 之后才发生），因此在 Dashboard 事件流里看不到裁剪效果；
+  该事件携带的 `inputTokens` 是本次注入量的估算值，可用于成本归因。
+- **熔断**：连续失败后出现 `circuit_breaker.tripped` 事件，issue 被打上
+  `hitl:waiting`（或按策略 `node:failed` / 跳过推进），且此后不再被重复派发。
+- **前置检查**：BLOCKER 失败时直接产生 `run.failed` 事件、**无 `run.progress`**
+  （agent 从未启动），`details.preflight.failed` 列出未通过的检查项。
+- 单元测试：`npm test`（含裁剪有界性、熔断计数与 token 记账、挂起态识别、
+  锁持有时序、preflight 配置组装等回归用例）；`npm run typecheck` 做类型门禁。
 
 ### 后续 P1 / P2
 

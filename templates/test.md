@@ -8,6 +8,12 @@ budget:
   max_input_tokens: 150000
   max_output_tokens: 40000
   max_tool_calls: 300
+retry:
+  max_attempts: 2
+  max_tokens: 30000000
+  max_duration_ms: 5400000
+  on_exhausted: hitl
+
 ---
 
 # 节点：测试验证
