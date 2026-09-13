@@ -1,3 +1,10 @@
+/**
+ * loop-node（执行面 worker）入口：不监听端口，主动外连 Gateway 的 WebSocket，
+ * hello 握手声明 nodeId / agents / token；收到 launch 后依次执行
+ * 前置检查 → 加载模板 → 上下文裁剪 → prompt 落盘 → node-pty 拉起 agent CLI，
+ * agent 输出逐 chunk 以 run.progress 流式回报，进程退出后回 run.result。
+ * worker 自身不持久化任务状态，重连后做什么完全由 Gateway 按 issue 标签重新决定。
+ */
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { WebSocket } from 'ws';
@@ -36,6 +43,7 @@ interface RunSlot {
   resetIdle?: () => void;
 }
 
+/** 在跑 run 登记表：用于响应 gateway 的 cancel，并以其大小作为 heartbeat 负载上报 */
 const activeRuns = new Map<string, RunSlot>();
 /** 已被孤儿化（断连强杀）的 run：其后续退出事件不再上报，见 orphanAllRuns */
 const orphanedRuns = new Set<string>();
@@ -65,6 +73,7 @@ const HALF_OPEN_SCAN_MS = GATEWAY_PING_MS;
 let lastGatewayMsgAt = Date.now();
 let halfOpenTimer: NodeJS.Timeout | undefined;
 
+// 只在 OPEN(1) 态发送：断连/重连窗口期静默丢弃，避免 ws 在 CLOSING/CLOSED 态 send 抛错
 function send(msg: WorkerToGateway) {
   if (socket && socket.readyState === 1) {
     socket.send(JSON.stringify(msg));
@@ -387,6 +396,7 @@ async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
       cwd: workdir,
       env: {
         ...process.env,
+        // 注入 run 身份变量，供 agent 或其包装脚本在输出 / 回调中关联本次运行
         HARNESS_RUN_ID: runId,
         HARNESS_NODE: nodeKey,
         HARNESS_WORK_ITEM: workItemId,

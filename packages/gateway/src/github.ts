@@ -1,3 +1,8 @@
+/**
+ * GitHub 事实源边界：Scheduler 只依赖 GithubClient 接口，real / mock 两个实现按配置切换，
+ * 换成 Meego/Jira 等只需新增一份实现。detectNode 负责从 issue 的 node:/hitl: 标签推导
+ * 流水线状态机；对 GitHub 的写操作（评论、标签）即流程状态的持久化，是调度回写的终点。
+ */
 import type { GatewayConfig } from './config.js';
 
 export interface Issue {
@@ -144,6 +149,8 @@ function realClient(config: GatewayConfig): GithubClient {
     },
 
     async setLabels(n, harnessLabels) {
+      // 不做全量 PUT：先读出当前标签，只删 node: 前缀的旧标签——
+      // hitl: 挂起标签与人工贴的标签必须原样保留，所以不能直接覆盖整个标签集
       const all = (await (await call('/issues?state=all&per_page=50')).json()) as any[];
       const issue = all.find((i) => i.number === n);
       const existing: string[] = issue

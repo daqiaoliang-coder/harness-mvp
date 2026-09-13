@@ -1,3 +1,8 @@
+/**
+ * 事件存储（better-sqlite3 同步驱动）：HarnessEvent 一律 append-only 落库。
+ * 选同步 API 是因为「内存 ++seq 计数 + INSERT」在 Node 单线程内一气呵成，天然原子，
+ * 无需事务包裹；配合 WAL，调度侧持续写入与看板/SSE 侧的并发查询互不阻塞。
+ */
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -43,6 +48,7 @@ export class EventStore {
   constructor(file: string) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     this.db = new Database(file);
+    // 写走 WAL、读走快照：tick 高频 append 期间 SSE 补发/看板查询不会被写锁住
     this.db.pragma('journal_mode = WAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -62,6 +68,7 @@ export class EventStore {
       CREATE INDEX IF NOT EXISTS idx_events_work_item ON events(work_item_id);
     `);
     const row = this.db.prepare('SELECT MAX(seq) AS m FROM events').get() as { m: number | null };
+    // 重启后从库中最大 seq 恢复内存计数，保证进程重启后序号继续单调、SSE 续传不错位
     this.seq = row.m ?? 0;
   }
 

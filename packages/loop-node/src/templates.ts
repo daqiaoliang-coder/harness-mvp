@@ -1,3 +1,9 @@
+/**
+ * 节点模板加载与渲染：模板 = YAML frontmatter（node/next/inputs/budget 元信息）
+ * + Markdown 正文（含 {{key}} 占位符）。按 nodeKey 在 templatesDir 下找
+ * <nodeKey>.md；文件缺失 / 不可读时 readFile 直接抛错，由 handleLaunch 捕获并
+ * 以 run.result: failed 上报——模板缺失属于阻断性配置错误，不应静默用空 prompt 开跑。
+ */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import YAML from 'yaml';
@@ -36,6 +42,7 @@ export async function loadTemplate(dir: string, nodeKey: string): Promise<Templa
   };
 }
 
+// budget 逐字段回退默认值：单个字段缺失或类型错误不牵连其余字段
 function parseBudget(raw: unknown): BudgetConfig {
   if (!raw || typeof raw !== 'object') return DEFAULT_BUDGET;
   const b = raw as Record<string, unknown>;
@@ -95,6 +102,7 @@ function parseFrontmatter(raw: string): { meta: Record<string, unknown>; body: s
       body,
     };
   } catch {
+    // frontmatter 不是合法 YAML 时不抛错：按无元信息处理（budget 等回落默认），正文保持原文
     return { meta: {}, body: raw };
   }
 }
@@ -102,6 +110,7 @@ function parseFrontmatter(raw: string): { meta: Record<string, unknown>; body: s
 export function renderPrompt(template: Template, context: Record<string, string>): string {
   let out = template.body;
   for (const [k, v] of Object.entries(context)) {
+    // 用 split/join 而非 String.replace：替换值中的 $&、$1 等不会被当作替换模式二次解释
     out = out.split(`{{${k}}}`).join(v);
   }
   return out;

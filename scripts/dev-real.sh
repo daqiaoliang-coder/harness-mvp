@@ -88,6 +88,8 @@ provider_slug() {
 
 resolve_secret GITHUB_TOKEN harness-github-token
 
+# 模型 key 的变量名与钥匙串 service 名均由 provider 推导：
+# 如 doubao → DOUBAO_API_KEY / harness-doubao-api-key，切换 provider 无需改本脚本
 TRAE_PROVIDER_RESOLVED="${TRAE_PROVIDER:-$(env_file_value TRAE_PROVIDER)}"
 TRAE_PROVIDER_RESOLVED="${TRAE_PROVIDER_RESOLVED:-doubao}"
 MODEL_KEY_VAR="$(printf '%s' "$TRAE_PROVIDER_RESOLVED" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9_' '_')_API_KEY"

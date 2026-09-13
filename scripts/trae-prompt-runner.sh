@@ -20,6 +20,7 @@ set -euo pipefail
 PROMPT_FILE="${1:?用法: trae-prompt-runner.sh <prompt-file-path>}"
 
 # uv tool 安装的 trae-cli 默认位于 ~/.local/bin
+# 必须解析 trae-cli（trae-agent 的命令行）：编辑器内置的 `trae` 是另一个程序，契约不兼容，不能替代
 export PATH="$HOME/.local/bin:$PATH"
 TRAE_CLI="$(command -v trae-cli || true)"
 if [[ -z "$TRAE_CLI" ]]; then

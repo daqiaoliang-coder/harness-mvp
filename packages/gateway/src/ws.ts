@@ -1,3 +1,9 @@
+/**
+ * Worker 接入通道（WebSocket，路径 /ws）：连接建立后 5s 内必须发 hello 并携带正确 token，
+ * 未完成握手的连接按协议码关闭——4001 握手超时、4003 token 无效。
+ * worker 的运行时事件（heartbeat / progress / result）在此先落库再广播；
+ * 面向看板的实时推送走 http.ts 的 SSE，两条通道分离。
+ */
 import type { Server } from 'node:http';
 import { WebSocketServer } from 'ws';
 import type { HarnessEvent, WorkerToGateway } from '@harness/shared';
@@ -95,6 +101,7 @@ export function attachWebSocketServer(ctx: Ctx) {
             projectId: ctx.config.projectId,
             runId: msg.runId,
             nodeId: worker.nodeId,
+            // 进度流高频且单 chunk 可能很长，截断到 800 字，避免事件表与 SSE 流量被刷屏
             details: { chunk: msg.chunk.slice(0, 800) },
           });
           break;
@@ -102,6 +109,8 @@ export function attachWebSocketServer(ctx: Ctx) {
         case 'run.result':
           worker.busy = false;
           worker.currentRunId = undefined;
+          // worker 层原始终态事件（失败即 run.failed，不带 workItemId）；
+          // scheduler 完成 GitHub 回写后会另发带 workItemId 的 issue.node.failed 语义事件
           emit({
             source: 'worker',
             event: `run.${msg.status}`,
@@ -132,6 +141,7 @@ export function attachWebSocketServer(ctx: Ctx) {
     socket.on('close', () => {
       clearTimeout(helloTimer);
       if (worker) {
+        // 断连即注销：scheduler 会释放该 worker 在跑 run 的 issue 锁（run.worker_lost），使 issue 可被重新派发
         ctx.scheduler.unregisterWorker(worker.nodeId);
         emit({
           source: 'harness',

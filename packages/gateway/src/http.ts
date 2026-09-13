@@ -1,3 +1,8 @@
+/**
+ * 控制面 HTTP（Express）：只读查询 API、dashboard 静态页，以及 /api/events/stream（SSE）。
+ * Worker 不走 HTTP——任务派发/回报通道在 ws.ts；SSE 只服务看板这类只读订阅方，
+ * 支持凭 Last-Event-ID（= 事件 seq）断线续传。
+ */
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -49,6 +54,8 @@ export function createHttpApp(ctx: Ctx) {
       req.headers['last-event-id'] ?? (req.query.lastEventId as string | undefined) ?? 0,
     );
 
+    // 先按 Last-Event-ID 同步补发离线期间事件，再订阅实时总线：
+    // 两步之间无 await，事件循环不会插入新写入，故既不丢事件也不产生空档
     for (const ev of ctx.store.listAfter(lastId)) {
       res.write(`id: ${ev.seq}\ndata: ${JSON.stringify(ev)}\n\n`);
     }
@@ -57,6 +64,7 @@ export function createHttpApp(ctx: Ctx) {
       res.write(`id: ${ev.seq}\ndata: ${JSON.stringify(ev)}\n\n`);
     });
 
+    // SSE 注释帧保活，穿透反向代理的空闲断流；连接关闭时必须清定时器并退订，否则句柄/监听器泄漏
     const keepalive = setInterval(() => res.write(': ping\n\n'), 15_000);
     req.on('close', () => {
       clearInterval(keepalive);

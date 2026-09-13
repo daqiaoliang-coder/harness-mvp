@@ -1,3 +1,9 @@
+/**
+ * 熔断器（纯内存记账，runKey = `${issueNumber}:${nodeKey}`）：拦截「同一节点反复失败」
+ * 造成的 token 空耗。失败次数 / 累计 token / 总时长任一触顶即熔断，由 Scheduler 打
+ * hitl:waiting 标签把 issue 挂起转人工；节点成功一次即 reset。记账不跨重启，
+ * 持久的流程状态仍以 GitHub 标签为准。
+ */
 import { DEFAULT_RETRY, type RetryPolicy } from '@harness/shared';
 
 // 默认策略与策略类型均以 shared 为唯一事实源，此处仅做转发，

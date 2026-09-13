@@ -1,3 +1,10 @@
+/**
+ * agent 运行预算：这里实际强制执行的只有注入上下文的输入 token 上限；
+ * maxOutputTokens / maxToolCalls 随模板配置透传，当前未在本文件内强制。
+ * token 数由 estimateTokens 按字符粗估，是裁剪用的内部口径，非模型真实计费值。
+ * 超支不抛错：pruneContext 就地裁剪上下文，并在 usage.exceeded / exceededFields /
+ * droppedFields 中告知被截断或整体省略的字段，硬保证裁剪后总量 <= maxInputTokens。
+ */
 export interface BudgetConfig {
   maxInputTokens: number;
   maxOutputTokens: number;

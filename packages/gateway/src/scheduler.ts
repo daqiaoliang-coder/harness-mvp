@@ -1,3 +1,11 @@
+/**
+ * 调度核心：定时轮询 GitHub open issues → detectNode 推导当前节点 → 派发给空闲 worker →
+ * 收到结果后把终态回写为标签/评论。三重并发控制：
+ *   - ticking：防止两轮 tick 重入；
+ *   - worker.busy：每个 worker 同时只跑一个 run（容量在收到结果时立即释放）；
+ *   - runsByIssue：同一 issue 的去重锁，持有到 GitHub 回写结束才释放。
+ * 内存锁只是运行时去重，跨重启/崩溃的流程状态一律以 GitHub 标签为准。
+ */
 import type { WebSocket } from 'ws';
 import type { GatewayToWorker, HarnessEvent, RetryPolicy } from '@harness/shared';
 import { estimateTokens } from '@harness/shared';
@@ -72,6 +80,8 @@ export class Scheduler {
   constructor(private deps: Deps) {}
 
   start() {
+    // setTimeout 自链而非 setInterval：上一轮 tick 完全结束（含回写）后才排下一轮，
+    // 慢轮询不会在事件循环里堆积；pollIntervalMs 是两轮之间的间隔而非固定频率
     this.stopped = false;
     const loop = () =>
       this.tick().finally(() => {
@@ -168,6 +178,8 @@ export class Scheduler {
     const w = this.workers.get(nodeId);
     if (!w) return;
     this.workers.delete(nodeId);
+    // 锁恢复：worker 断连时其在跑的 run 已无结果可等，按 worker_lost 释放 issue 锁，
+    // 标签仍停在当前节点，下一轮 tick 即可重新派发给其他 worker
     if (w.currentRunId) this.releaseRun(w.currentRunId, 'worker_lost');
   }
 
@@ -191,11 +203,13 @@ export class Scheduler {
   }
 
   private async tick() {
+    // 重入兜底：正常路径已由 start() 的自链定时器保证串行，标志位再防意外的并发调用
     if (this.ticking) return;
     this.ticking = true;
     try {
       const issues = await this.deps.github.listIssues();
       for (const issue of issues) {
+        // issue 去重锁：正在执行或正在回写的 issue 本轮直接跳过
         if (this.runsByIssue.has(issue.number)) continue;
         await this.maybeDispatch(issue);
       }

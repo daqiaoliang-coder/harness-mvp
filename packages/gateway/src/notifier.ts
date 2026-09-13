@@ -186,6 +186,7 @@ export function signTimestamp(secret: string, timestamp: string): string {
 }
 
 async function postCard(webhookUrl: string, payload: FeishuPayload): Promise<void> {
+  // fire-and-forget 请求必须自带超时：飞书端挂起时否则 Promise/句柄无限堆积，finally 里释放定时器
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
   try {

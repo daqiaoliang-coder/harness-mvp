@@ -1,3 +1,8 @@
+/**
+ * Gateway 配置：全部来自环境变量并带本地可跑的默认值。
+ * 未显式设置 GITHUB_MODE 时，三项 GitHub 凭据齐全才走 real，否则自动回退 mock（零配置启动）；
+ * workerToken 是 WS 握手的唯一鉴权凭据，默认值仅限本地开发。
+ */
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,6 +39,7 @@ const repoRoot = path.resolve(here, '../../..');
 export function loadConfig(): GatewayConfig {
   const hasCreds =
     !!process.env.GITHUB_TOKEN && !!process.env.GITHUB_OWNER && !!process.env.GITHUB_REPO;
+  // 显式 GITHUB_MODE 优先；缺省时按凭据完整性自动选择，防止「配了一半」却以 real 启动
   const mode = (process.env.GITHUB_MODE as 'real' | 'mock') ?? (hasCreds ? 'real' : 'mock');
 
   return {

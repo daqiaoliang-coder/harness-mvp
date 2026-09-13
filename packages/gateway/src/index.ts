@@ -1,3 +1,8 @@
+/**
+ * Gateway 组合根/启动入口：按依赖顺序构造 config → EventStore/EventBus → GitHub client /
+ * 熔断器 → Scheduler → HTTP 与 WS，最后启动轮询。SIGINT/SIGTERM 触发优雅关闭，
+ * 顺序为停调度（不再派发新 run）→ 关 WS（拒绝新 worker 消息）→ 关 HTTP 后退出。
+ */
 import { loadConfig } from './config.js';
 import { EventStore } from './db.js';
 import { EventBus } from './bus.js';

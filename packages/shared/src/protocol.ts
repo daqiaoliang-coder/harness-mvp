@@ -1,5 +1,10 @@
 /**
- * 四类事件源：
+ * gateway ↔ loop-node（worker）之间 WebSocket 通信的消息契约，两端共享此文件。
+ * 消息按方向分为两个以 type 为判别字段的联合：
+ *   - WorkerToGateway：注册 / 心跳 / 运行进度与结果；
+ *   - GatewayToWorker：注册应答、launch 下发、cancel 与 ping。
+ * 扩展时在对应联合追加成员，type 沿用命名空间前缀（如 run.*、hello.*），收发两端需同步实现。
+ * 下方 EventSource / HarnessEvent 属于事件日志体系，与上述 WS 消息相互独立：
  *  - github   外部工作流平台事件（对应 Meego）
  *  - openapi  API 调用事件
  *  - harness  编排事件（Gateway 内部决策）

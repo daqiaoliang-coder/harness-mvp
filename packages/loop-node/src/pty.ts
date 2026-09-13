@@ -1,3 +1,9 @@
+/**
+ * agent 进程执行层：优先用 node-pty 以真实 TTY 拉起 agent CLI，
+ * 原生模块加载失败时降级为 child_process.spawn（链路可用但丢失 TTY 能力）。
+ * 对上层只暴露 onData（流式输出）/ onExit（终态退出码）两个回调，
+ * 并保证 onExit 恰好触发一次；spawn 类错误按非零退出码走失败上报，不炸 node 进程。
+ */
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -101,6 +107,7 @@ export function runAgent(opts: RunAgentOptions): AgentHandle {
       cwd: opts.cwd,
       env: opts.env as Record<string, string>,
     });
+    // 终态去重：kill 与 onExit 回调存在竞争时，保证上层 onExit 只被调一次
     let exited = false;
     const emitExit = (code: number) => {
       if (exited) return;
@@ -125,6 +132,8 @@ export function runAgent(opts: RunAgentOptions): AgentHandle {
     cwd: opts.cwd,
     env: opts.env as NodeJS.ProcessEnv,
   });
+  // 终态去重：spawn 分支里 'error'（如命令不存在）之后 Node 通常还会补发 'exit'，
+  // 不拦截就会用后一个退出码把 127 失败终态覆盖掉
   let exited = false;
   const emitExit = (code: number) => {
     if (exited) return;
