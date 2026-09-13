@@ -16,27 +16,53 @@ export interface GithubClient {
 }
 
 const NODE_PREFIX = 'node:';
+/** 人工卡点标签前缀。带此前缀的 issue 表示流程已挂起，调度必须跳过。 */
+const HITL_PREFIX = 'hitl:';
+/** 熔断或需要人工判断时打上的挂起标签。 */
+export const HITL_WAITING = `${HITL_PREFIX}waiting`;
+
+/** Harness 自己管理的标签前缀；人工标签不在此列，setLabels 时必须原样保留。 */
+export const MANAGED_PREFIXES = [NODE_PREFIX, HITL_PREFIX];
 
 export interface NodeDetection {
   current: string | null;
   index: number;
   isNew: boolean;
+  /**
+   * 流程已挂起（带 hitl:waiting 标签），等待人工放行。
+   *
+   * 为什么必须单列这个状态：早期实现里 detectNode 只认 node: 前缀标签，
+   * 熔断打上 hitl:waiting 后调度看不到任何「已挂起」信号，
+   * 下一轮 tick 就把该 issue 当成待派发重新跑一遍——失败、再熔断、再重跑，
+   * 形成无限循环持续烧 token，恰好抵消了熔断本身的价值。
+   */
+  suspended: boolean;
 }
 
 export function detectNode(issue: Issue, pipeline: string[]): NodeDetection {
+  // 挂起判定优先于节点推导：人工未放行前，无论当前节点是什么都不派发。
+  if (issue.labels.some((l) => l.startsWith(HITL_PREFIX))) {
+    return { current: null, index: -1, isNew: false, suspended: true };
+  }
+
   const nodeLabels = issue.labels
     .filter((l) => l.startsWith(NODE_PREFIX))
     .map((l) => l.slice(NODE_PREFIX.length));
 
   if (nodeLabels.includes('done')) {
-    return { current: null, index: pipeline.length, isNew: false };
+    return { current: null, index: pipeline.length, isNew: false, suspended: false };
   }
   if (nodeLabels.length === 0) {
-    return { current: pipeline[0] ?? null, index: 0, isNew: true };
+    return { current: pipeline[0] ?? null, index: 0, isNew: true, suspended: false };
   }
   const current = nodeLabels[0];
   const index = pipeline.indexOf(current);
-  return { current: index === -1 ? null : current, index, isNew: false };
+  return {
+    current: index === -1 ? null : current,
+    index,
+    isNew: false,
+    suspended: false,
+  };
 }
 
 export function createGithubClient(config: GatewayConfig): GithubClient {

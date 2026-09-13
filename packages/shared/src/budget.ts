@@ -27,34 +27,68 @@ export interface BudgetUsage {
   outputTokens: number;
   toolCalls: number;
   exceeded: boolean;
+  /** 被截断或被省略的字段名 */
   exceededFields: string[];
+  /** 预算耗尽后被整体省略（只留占位符）的字段名 */
+  droppedFields: string[];
 }
 
 /**
- * 按预算裁剪 context：
- * - 总输入不超过 maxInputTokens
- * - 超预算的字段只保留前 200 字符 + 截断标记
+ * 按预算裁剪 context，**硬保证** usage.inputTokens <= budget.maxInputTokens。
+ *
+ * 三段式策略：
+ *  1. 预算内 → 原样透传；
+ *  2. 预算不足但仍有剩余余量 → 二分求出「头部 + 截断标记」不超过余量的最大前缀；
+ *  3. 余量耗尽 → 只留一行占位符，且**不计入 total**（占位符是有界常量，
+ *     否则字段数量一多，累计的标记文本本身就能把预算撑爆）。
+ *
+ * 为什么必须这样：早期实现是「超预算字段一律截到前 200 字符并累加」，
+ * 在字段数较多时（例如 20 个字段 × 每个 1000 token、预算 200）
+ * 裁剪后总量反而达到 1200，预算完全不封顶。
  */
 export function pruneContext(
   context: Record<string, string>,
   budget: BudgetConfig,
 ): { pruned: Record<string, string>; usage: BudgetUsage } {
-  const entries = Object.entries(context);
+  const limit = budget.maxInputTokens;
   const pruned: Record<string, string> = {};
-  let total = 0;
   const exceededFields: string[] = [];
+  const droppedFields: string[] = [];
+  let total = 0;
 
-  for (const [key, value] of entries) {
+  for (const [key, value] of Object.entries(context)) {
     const tokens = estimateTokens(value);
-    if (total + tokens <= budget.maxInputTokens) {
+
+    // 1) 预算内，原样透传
+    if (total + tokens <= limit) {
       pruned[key] = value;
       total += tokens;
-    } else {
-      const head = value.slice(0, 200);
-      pruned[key] = head + `\n\n[...已截断，原字段约 ${tokens} tokens]`;
-      total += estimateTokens(pruned[key]);
-      exceededFields.push(key);
+      continue;
     }
+
+    const remaining = limit - total;
+    exceededFields.push(key);
+
+    // 3) 余量耗尽，只留占位符且不计入 total
+    if (remaining <= 0) {
+      pruned[key] = `[已省略：上下文预算耗尽，原字段约 ${tokens} tokens]`;
+      droppedFields.push(key);
+      continue;
+    }
+
+    // 2) 二分求最大可保留前缀，使「前缀 + 截断标记」整体不超过余量。
+    //    estimateTokens 对前缀长度单调不减，故二分成立。
+    const marker = (head: string) => `${head}\n\n[...已截断，原字段约 ${tokens} tokens]`;
+    let lo = 0;
+    let hi = value.length;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (estimateTokens(marker(value.slice(0, mid))) <= remaining) lo = mid;
+      else hi = mid - 1;
+    }
+    const head = value.slice(0, lo);
+    pruned[key] = marker(head);
+    total += estimateTokens(marker(head));
   }
 
   return {
@@ -65,6 +99,7 @@ export function pruneContext(
       toolCalls: 0,
       exceeded: exceededFields.length > 0,
       exceededFields,
+      droppedFields,
     },
   };
 }
