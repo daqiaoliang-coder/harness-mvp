@@ -24,7 +24,9 @@ harness-mvp/
 │   ├── code.md
 │   └── test.md
 └── scripts/
-    └── mock-agent.mjs   # 无需真实 Agent CLI 的模拟器
+    ├── mock-agent.mjs           # 无需真实 Agent CLI 的模拟器
+    ├── dev-real.sh              # 真实 GitHub + trae-cli 一键启动
+    └── trae-prompt-runner.sh    # trae-agent CLI 的适配包装
 ```
 
 ## 架构
@@ -306,11 +308,43 @@ loop-node 是无状态执行面：启动即连 Gateway，收 `launch` →
 
 ## 快速开始
 
+两种模式共用同一份依赖，先安装（只需一次；dev-real.sh 不会自动安装依赖）：
+
 ```bash
 npm install
-npm run dev
-
 ```
+
+### 模式 A：mock 模式（默认，零配置）
+
+不需要 GitHub token、不需要真实 Agent CLI，GitHub 侧走内存 mock：
+
+```bash
+npm run dev
+```
+
+### 模式 B：真实 GitHub + trae-cli
+
+前置：Node 20（脚本经 nvm 自动切换）、已安装
+[bytedance/trae-agent](https://github.com/bytedance/trae-agent)（`uv tool install trae-agent`）。
+
+```bash
+# 密钥写入 macOS 钥匙串（不落盘；也可用 shell env 或 .env，详见脚本头注释）
+security add-generic-password -a "$USER" -s harness-github-token -w
+security add-generic-password -a "$USER" -s harness-doubao-api-key -w
+
+cp .env.example .env       # 必需：脚本启动时直接读取 .env
+# 编辑 .env：GITHUB_MODE=real、GITHUB_OWNER/GITHUB_REPO、TRAE_MODEL 等
+./scripts/dev-real.sh
+```
+
+`dev-real.sh` 负责切换 Node 20、三级解析密钥（env > 钥匙串 > .env）、
+自愈 node-pty spawn-helper 权限、清理残留 dev 栈，最后仍以 `npm run dev`
+拉起 gateway + loop-node。
+
+两种模式启动后：
+
+- Dashboard：<http://localhost:8787/dashboard/>
+- SSE 事件流：<http://localhost:8787/api/events/stream>
 
 
 ---
