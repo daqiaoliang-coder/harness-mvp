@@ -16,11 +16,22 @@ import { startFeishuNotifier } from './notifier.js';
 const config = loadConfig();
 const store = new EventStore(config.dbPath);
 const bus = new EventBus();
-const github = createGithubClient(config);
+
+// openapi 事件落库 + 广播：与 scheduler.emit 同口径（先持久化再广播），
+// 但 GitHub client 不反向依赖 Scheduler，故在组合根直接接线
+const github = createGithubClient(config, (rec) => {
+  const ev = store.append({
+    source: 'openapi',
+    event: 'api.call',
+    projectId: config.projectId,
+    details: rec as unknown as Record<string, unknown>,
+  });
+  bus.emitEvent(ev);
+});
 const circuitBreaker = new CircuitBreaker();
 const scheduler = new Scheduler({ config, store, bus, github, circuitBreaker });
 
-const app = createHttpApp({ config, store, bus, scheduler });
+const app = createHttpApp({ config, store, bus, scheduler, github });
 const server = app.listen(config.httpPort, () => {
   console.log(`[gateway] HTTP   http://localhost:${config.httpPort}`);
   console.log(`[gateway] SSE    http://localhost:${config.httpPort}/api/events/stream`);

@@ -12,17 +12,35 @@
         margin: 0;
         padding: 16px;
       }
-      h1 { font-size: 13px; color: #6a8099; font-weight: 500; letter-spacing: .1em; margin: 0 0 12px; }
-      .grid { display: grid; grid-template-columns: 1fr 280px; gap: 16px; }
-      .events {
-        background: #131a22; border-radius: 8px; padding: 10px;
-        height: calc(100vh - 80px); overflow-y: auto;
+      h1 { font-size: 13px; color: #6a8099; font-weight: 500; letter-spacing: .1em; margin: 0 0 10px; }
+      .chips { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }
+      .chip {
+        background: #131a22; border-radius: 6px; padding: 4px 10px;
+        font-size: 11px; color: #6a8099; display: flex; gap: 6px; align-items: center;
       }
-      .ev { padding: 5px 8px; border-left: 3px solid #2a3746; margin-bottom: 3px; font-size: 12px; }
+      .chip b { color: #d4e0ea; }
+      .chip.filter { cursor: pointer; color: #f0883e; border: 1px solid #4d3200; }
+      .chip.filter b { color: #f0883e; }
+      .st-running { color: #3fb950; }
+      .st-failed  { color: #f85149; }
+      .st-hitl    { color: #d29922; }
+      .st-done    { color: #58a6ff; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th { text-align: left; color: #6a8099; font-weight: 500; padding: 4px 8px; border-bottom: 1px solid #2a3746; }
+      td { padding: 4px 8px; border-bottom: 1px solid #1c242e; }
+      tr:hover td { background: #182130; cursor: pointer; }
+      .panel {
+        background: #131a22; border-radius: 8px; padding: 8px;
+        margin-bottom: 12px; max-height: 230px; overflow-y: auto;
+      }
+      .grid { display: grid; grid-template-columns: 1fr 300px; gap: 12px; }
+      .events { background: #131a22; border-radius: 8px; padding: 10px; height: calc(100vh - 400px); min-height: 260px; overflow-y: auto; }
+      .ev { padding: 4px 8px; border-left: 3px solid #2a3746; margin-bottom: 3px; font-size: 12px; }
       .ev.github  { border-color: #58a6ff; }
       .ev.harness { border-color: #d29922; }
       .ev.worker  { border-color: #3fb950; }
       .ev.openapi { border-color: #a371f7; }
+      .ev.dim { opacity: .3; }
       .ts { color: #6a8099; }
       .src { font-weight: 600; }
       .ev.github  .src { color: #58a6ff; }
@@ -33,21 +51,187 @@
       .stat { display: flex; justify-content: space-between; padding: 5px 0; font-size: 12px; border-bottom: 1px solid #1c242e; }
       .stat:last-child { border-bottom: none; }
       .stat b { color: #d4e0ea; }
+      .hint { color: #4d5966; font-size: 11px; margin-top: 8px; line-height: 1.6; }
     </style>
   </head>
   <body>
-    <h1>HARNESS MVP · 事件流</h1>
+    <h1>HARNESS MVP · 观测看板</h1>
+    <div class="chips">
+      <span class="chip">连接 <b id="status">连接中…</b></span>
+      <span class="chip">事件数 <b id="count">0</b></span>
+      <span class="chip">最后序号 <b id="seq">0</b></span>
+      <span class="chip filter" id="filterChip" hidden>过滤 <b id="filterLabel"></b> ✕</span>
+      <label class="chip" style="cursor:pointer"><input type="checkbox" id="hideOpenapi" checked style="margin:0 4px 0 0">隐藏 openapi 轮询</label>
+    </div>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Issue</th><th>标题</th><th>当前节点</th><th>状态</th><th>尝试</th><th>节点耗时</th><th>Tokens (in/out)</th><th>HITL 累计</th><th>最后活动</th></tr>
+        </thead>
+        <tbody id="issues"><tr><td colspan="9" class="ts">等待事件…</td></tr></tbody>
+      </table>
+    </div>
+
     <div class="grid">
       <div class="events" id="events"></div>
       <aside>
-        <div class="stat"><span>连接</span><b id="status">连接中…</b></div>
-        <div class="stat"><span>事件数</span><b id="count">0</b></div>
-        <div class="stat"><span>最后序号</span><b id="seq">0</b></div>
+        <div class="stat"><span>活跃 issue</span><b id="sOpen">0</b></div>
+        <div class="stat"><span>执行中</span><b id="sRunning">0</b></div>
+        <div class="stat"><span>HITL 等待</span><b id="sHitl">0</b></div>
+        <div class="stat"><span>已完成</span><b id="sDone">0</b></div>
+        <div class="stat"><span>真实 Tokens</span><b id="sTok">0</b></div>
+        <div class="hint">点击 issue 行 → 按 workItemId 过滤事件流；点击事件行 → 按 runId 过滤。点击顶部 ✕ 清除过滤。</div>
       </aside>
     </div>
+
     <script>
       const eventsEl = document.getElementById('events');
+      const issuesBody = document.getElementById('issues');
+      const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      const fmtMs = (ms) => ms == null ? '—' : ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms/1000).toFixed(1)}s` : `${Math.floor(ms/60000)}m${Math.round((ms%60000)/1000)}s`;
+      const fmtTok = (n) => n >= 1e6 ? `${(n/1e6).toFixed(2)}M` : n >= 1e3 ? `${(n/1e3).toFixed(1)}k` : String(n);
+
+      /** issue 聚合状态：纯客户端从事件流重建（SSE 首连全量重放历史） */
+      const issues = new Map();
       let count = 0, lastSeq = 0;
+      let filterRunId = null, filterWorkItem = null;
+      let totalTranscriptTokens = 0;
+
+      const fmtTs = (iso) => new Date(iso).toLocaleTimeString();
+
+      function issue(id) {
+        let r = issues.get(id);
+        if (!r) issues.set(id, (r = { id, title: '', node: '—', status: '新', attempt: 0, lastDurationMs: null, tokens: null, estTokens: 0, hitlTotalMs: 0, hitlEnteredAt: null, lastTs: null }));
+        return r;
+      }
+
+      function handle(ev) {
+        const d = ev.details ?? {};
+        const wid = ev.workItemId ? Number(ev.workItemId) : null;
+        const r = wid != null ? issue(wid) : null;
+        if (r) r.lastTs = ev.timestamp;
+        switch (ev.event) {
+          case 'run.dispatched':
+            if (r) { r.status = '执行中'; r.title = d.context?.['issue.title'] ?? r.title; r.estTokens += d.inputTokens ?? 0; }
+            break;
+          case 'issue.node.assigned': if (r) { r.node = d.nodeKey ?? r.node; r.status = '待派发'; } break;
+          case 'issue.node.failed':
+            if (r) {
+              r.status = d.preflight && d.preflight.passed === false ? '环境失败' : '失败待重试';
+              r.attempt = d.attempt ?? r.attempt;
+              r.lastDurationMs = d.durationMs ?? r.lastDurationMs;
+              if (d.tokens) { r.tokens = d.tokens; totalTranscriptTokens += d.tokens.input + d.tokens.output; }
+            }
+            break;
+          case 'circuit_breaker.tripped': if (r) r.status = '熔断'; break;
+          case 'hitl.entered':
+            if (r) { r.status = 'HITL 等待中'; r.hitlEnteredAt = Date.parse(ev.timestamp); }
+            break;
+          case 'hitl.resolved':
+            if (r) { r.hitlEnteredAt = null; r.hitlTotalMs += d.waitMs ?? 0; r.status = '已解除等待'; }
+            break;
+          case 'issue.node.advanced':
+            if (r) {
+              r.node = d.to ?? r.node; r.status = '进行中';
+              r.attempt = d.attempt ?? r.attempt;
+              r.lastDurationMs = d.durationMs ?? r.lastDurationMs;
+              if (d.tokens) { r.tokens = d.tokens; totalTranscriptTokens += d.tokens.input + d.tokens.output; }
+            }
+            break;
+          case 'issue.completed': if (r) { r.status = '✅ 完成'; r.hitlEnteredAt = null; } break;
+          case 'run.worker_lost': case 'run.transition_failed': if (r) r.status = '等待重派'; break;
+        }
+      }
+
+      function renderIssues() {
+        const now = Date.now();
+        const rows = [...issues.values()].sort((a, b) => {
+          const done = (x) => x.status.includes('完成');
+          if (done(a) !== done(b)) return done(a) ? 1 : -1;
+          return (b.lastTs ?? '').localeCompare(a.lastTs ?? '');
+        });
+        if (!rows.length) { issuesBody.innerHTML = '<tr><td colspan="9" class="ts">等待事件…</td></tr>'; return; }
+        issuesBody.innerHTML = rows.map((r) => {
+          const liveHitl = r.hitlEnteredAt ? r.hitlTotalMs + (now - r.hitlEnteredAt) : (r.hitlTotalMs || null);
+          const tok = r.tokens ? `${fmtTok(r.tokens.input)} / ${fmtTok(r.tokens.output)}` : r.estTokens ? `~${fmtTok(r.estTokens)}` : '—';
+          const cls = r.status.includes('执行') ? 'st-running' : r.status.includes('HITL') || r.status.includes('熔断') ? 'st-hitl' : r.status.includes('完成') ? 'st-done' : r.status.includes('失败') || r.status.includes('环境') ? 'st-failed' : '';
+          return `<tr data-wid="${r.id}">
+            <td>#${r.id}</td>
+            <td>${esc(r.title).slice(0, 30) || '—'}</td>
+            <td>${esc(r.node)}</td>
+            <td class="${cls}">${esc(r.status)}</td>
+            <td>${r.attempt || '—'}</td>
+            <td>${fmtMs(r.lastDurationMs)}</td>
+            <td>${tok}</td>
+            <td>${liveHitl ? fmtMs(liveHitl) : '—'}</td>
+            <td class="ts">${r.lastTs ? fmtTs(r.lastTs) : '—'}</td>
+          </tr>`;
+        }).join('');
+        let open = 0, running = 0, hitl = 0, done = 0;
+        for (const r of issues.values()) {
+          if (r.status.includes('完成')) { done++; continue; }
+          open++;
+          if (r.status.includes('执行')) running++;
+          if (r.status.includes('HITL')) hitl++;
+        }
+        document.getElementById('sOpen').textContent = open;
+        document.getElementById('sRunning').textContent = running;
+        document.getElementById('sHitl').textContent = hitl;
+        document.getElementById('sDone').textContent = done;
+        document.getElementById('sTok').textContent = fmtTok(totalTranscriptTokens);
+      }
+
+      function matches(ev) {
+        if (filterRunId) return ev.runId === filterRunId;
+        if (filterWorkItem) return ev.workItemId === filterWorkItem;
+        return true;
+      }
+
+      const hideOpenapi = document.getElementById('hideOpenapi');
+      function applyVisibility(el) {
+        const ev = { runId: el.dataset.runId || undefined, workItemId: el.dataset.wid || undefined, source: el.dataset.source };
+        const hidden = (hideOpenapi.checked && ev.source === 'openapi') || !matches(ev);
+        el.style.display = hidden ? 'none' : '';
+      }
+
+      function renderEvent(ev) {
+        const div = document.createElement('div');
+        div.className = 'ev ' + ev.source;
+        div.dataset.runId = ev.runId ?? '';
+        div.dataset.wid = ev.workItemId ?? '';
+        div.dataset.source = ev.source;
+        const details = ev.details && Object.keys(ev.details).length
+          ? `<div class="details">${esc(JSON.stringify(ev.details)).slice(0, 400)}</div>`
+          : '';
+        div.innerHTML =
+          `<span class="ts">${fmtTs(ev.timestamp)}</span> ` +
+          `<span class="src">[${esc(ev.source)}]</span> ${esc(ev.event)}` +
+          (ev.runId ? ` <span class="ts">run=${esc(ev.runId)}</span>` : '') +
+          details;
+        applyVisibility(div);
+        eventsEl.appendChild(div);
+        eventsEl.scrollTop = eventsEl.scrollHeight;
+      }
+
+      function setFilter(runId, wid) {
+        filterRunId = runId; filterWorkItem = wid;
+        const chip = document.getElementById('filterChip');
+        chip.hidden = !runId && !wid;
+        document.getElementById('filterLabel').textContent = runId ? `run=${runId}` : `issue#${wid}`;
+        for (const el of eventsEl.children) applyVisibility(el);
+      }
+      hideOpenapi.onchange = () => { for (const el of eventsEl.children) applyVisibility(el); };
+      document.getElementById('filterChip').onclick = () => setFilter(null, null);
+      issuesBody.onclick = (e) => {
+        const tr = e.target.closest('tr[data-wid]');
+        if (tr) setFilter(null, tr.dataset.wid);
+      };
+      eventsEl.onclick = (e) => {
+        const div = e.target.closest('.ev');
+        if (div?.dataset.runId) setFilter(div.dataset.runId, null);
+      };
+
       const es = new EventSource('/api/events/stream');
       es.onopen = () => (document.getElementById('status').textContent = '已连接');
       es.onerror = () => (document.getElementById('status').textContent = '重连中…');
@@ -58,20 +242,12 @@
         count++;
         document.getElementById('count').textContent = count;
         document.getElementById('seq').textContent = lastSeq;
-        const div = document.createElement('div');
-        div.className = 'ev ' + ev.source;
-        const details =
-          ev.details && Object.keys(ev.details).length
-            ? `<div class="details">${JSON.stringify(ev.details).slice(0, 400)}</div>`
-            : '';
-        div.innerHTML =
-          `<span class="ts">${new Date(ev.timestamp).toLocaleTimeString()}</span> ` +
-          `<span class="src">[${ev.source}]</span> ${ev.event}` +
-          (ev.runId ? ` <span class="ts">run=${ev.runId}</span>` : '') +
-          details;
-        eventsEl.appendChild(div);
-        eventsEl.scrollTop = eventsEl.scrollHeight;
+        handle(ev);
+        renderEvent(ev);
+        renderIssues();
       };
+      // HITL 等待中的行每秒刷新实时等待时长
+      setInterval(renderIssues, 1000);
     </script>
   </body>
 </html>

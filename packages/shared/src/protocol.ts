@@ -74,6 +74,17 @@ export type WorkerToGateway =
       retry?: RetryPolicy;
       /** 前置检查结果摘要，便于控制面区分「环境问题」与「业务失败」。 */
       preflight?: { passed: boolean; failed: string[] };
+      /**
+       * worker 侧耗时：从收到 launch 到发出本次结果（含模板加载/preflight/prompt 落盘/agent 执行）。
+       * 控制面另有按 dispatch 时刻计算的端到端耗时，两者口径不同，各自上报。
+       */
+      durationMs?: number;
+      /**
+       * agent 真实用量：从 run 工作目录 trajectories/*.json 的 llm_interactions[].response.usage
+       * 原样累加（input_tokens / output_tokens）。缺省表示拿不到 transcript（如 mock agent、
+       * agent 启动前失败），控制面沿用注入 token 估算口径。
+       */
+      tokens?: { input: number; output: number };
     };
 
 /** Gateway → Worker */

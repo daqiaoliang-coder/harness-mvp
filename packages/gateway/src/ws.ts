@@ -121,6 +121,11 @@ export function attachWebSocketServer(ctx: Ctx) {
               error: msg.error,
               // 前置检查未通过即失败：与「业务执行失败」区分开，便于定位环境问题
               preflight: msg.preflight,
+              // worker 侧耗时（收到 launch → 发出结果）
+              durationMs: msg.durationMs,
+              // output 已在 worker 侧裁到 64KiB 尾部，入库再截到 1000 字：
+              // 事件流承担 debug trace，全文以 GitHub 评论（3000 字）为准
+              outputTail: msg.output?.slice(-1000),
             },
           });
           try {
@@ -129,6 +134,9 @@ export function attachWebSocketServer(ctx: Ctx) {
               error: msg.error,
               // 控制面不读模板，策略由执行面解析后回报
               retry: msg.retry,
+              preflight: msg.preflight,
+              durationMs: msg.durationMs,
+              tokens: msg.tokens,
             });
           } catch (e) {
             // onRunResult 内部已有兜底；这里防止任何未预期异常导致 gateway 进程退出

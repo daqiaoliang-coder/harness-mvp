@@ -136,6 +136,42 @@ export function buildCardSpec(ev: HarnessEvent, config: GatewayConfig): CardSpec
         ].filter(Boolean) as string[],
       };
 
+    case 'circuit_breaker.tripped':
+      return {
+        color: 'red',
+        title: `🛑 熔断触发 · ${str(d.nodeKey) ?? 'unknown'}`,
+        lines: [
+          issueLine,
+          `**节点**：\`${str(d.nodeKey) ?? '?'}\`\u3000**处置**：${str(d.onExhausted) ?? '?'}`,
+          `**原因**：${truncate(str(d.reason) ?? 'unknown', 300)}`,
+          typeof d.accumulatedTokens === 'number'
+            ? `**累计消耗**：${d.accumulatedTokens} tokens`
+            : undefined,
+        ].filter(Boolean) as string[],
+      };
+
+    case 'hitl.entered':
+      return {
+        color: 'orange',
+        title: `🖐 人工介入 · ${str(d.nodeKey) ?? 'unknown'}`,
+        lines: [
+          issueLine,
+          `节点 \`${str(d.nodeKey) ?? '?'}\` 已挂起等待人工放行（摘除 hitl:waiting 标签即恢复）。`,
+          d.inferred === true ? '⚠️ 进入时刻为重启后首次观察的近似值' : undefined,
+        ].filter(Boolean) as string[],
+      };
+
+    case 'hitl.escalated':
+      return {
+        color: 'red',
+        title: `⏰ 人工介入超时升级 · ${str(d.nodeKey) ?? 'unknown'}`,
+        lines: [
+          issueLine,
+          `节点 \`${str(d.nodeKey) ?? '?'}\` 已等待 ${Math.round((Number(d.waitMs) || 0) / 60000)} 分钟，超过升级阈值，请尽快处理。`,
+          d.inferredEntry === true ? '⚠️ 等待时长基于近似进入时刻' : undefined,
+        ].filter(Boolean) as string[],
+      };
+
     default:
       return null;
   }

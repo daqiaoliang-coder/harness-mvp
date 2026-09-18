@@ -10,7 +10,7 @@
     "dev:node": "npm --workspace @harness/loop-node run dev",
     "start:gw": "npm --workspace @harness/gateway run start",
     "start:node": "npm --workspace @harness/loop-node run start",
-    "test": "tsx --test packages/*/src/**/*.test.ts",
+    "test": "tsx --test packages/gateway/src/*.test.ts packages/shared/src/*.test.ts packages/loop-node/src/*.test.ts",
     "test:gw": "tsx --test packages/gateway/src/*.test.ts",
     "test:shared": "tsx --test packages/shared/src/*.test.ts",
     "test:node": "tsx --test packages/loop-node/src/*.test.ts",

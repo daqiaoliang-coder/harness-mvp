@@ -10,12 +10,16 @@ import type { GatewayConfig } from './config.js';
 import type { EventStore } from './db.js';
 import type { EventBus } from './bus.js';
 import type { Scheduler } from './scheduler.js';
+import type { GithubClient } from './github.js';
+import { buildEvidence } from './evidence.js';
+import { scoreDelivery } from './scoring.js';
 
 interface Ctx {
   config: GatewayConfig;
   store: EventStore;
   bus: EventBus;
   scheduler: Scheduler;
+  github: GithubClient;
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +45,43 @@ export function createHttpApp(ctx: Ctx) {
 
   app.get('/api/runs', (_req, res) => {
     res.json(ctx.scheduler.listRuns());
+  });
+
+  /**
+   * 证据包冻结：按 issue 导出全量事件 + 派生指标 + 交付效率分。
+   * ?download=1 时以附件下载（文件名固定，便于归档）；默认内联 JSON。
+   * GitHub 侧快照是尽力而为——平台不可达时仍可从本地事件库出证据。
+   */
+  app.get('/api/issues/:n/evidence', async (req, res) => {
+    const n = String(req.params.n);
+    const events = ctx.store.findByWorkItem(n);
+    if (events.length === 0) {
+      res.status(404).json({ error: `issue ${n} 无任何事件记录` });
+      return;
+    }
+    let snapshot;
+    try {
+      snapshot = (await ctx.github.listIssues()).find((i) => String(i.number) === n);
+    } catch {
+      // GitHub 不可达不阻断证据导出：事件库才是评分的事实来源
+      snapshot = undefined;
+    }
+    const bundle = buildEvidence(n, events, snapshot);
+    if (req.query.download === '1') {
+      res.setHeader('Content-Disposition', `attachment; filename="evidence-issue-${n}.json"`);
+    }
+    res.json(bundle);
+  });
+
+  /** 轻量评分查询：只返回分数与归因，不拖全量事件（看板/通知可用）。 */
+  app.get('/api/issues/:n/score', (req, res) => {
+    const n = String(req.params.n);
+    const events = ctx.store.findByWorkItem(n);
+    if (events.length === 0) {
+      res.status(404).json({ error: `issue ${n} 无任何事件记录` });
+      return;
+    }
+    res.json(scoreDelivery(n, events));
   });
 
   app.get('/api/events/stream', (req, res) => {

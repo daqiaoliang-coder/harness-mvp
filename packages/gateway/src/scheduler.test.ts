@@ -25,6 +25,7 @@ function makeConfig() {
     github: { mode: 'mock' as const, pollIntervalMs: 5000 },
     worker: { pingIntervalMs: 15_000, staleMs: 45_000 },
     feishu: {},
+    alerts: { hitlEscalateMs: 0 },
   };
 }
 
@@ -214,6 +215,162 @@ test('末节点完成：打 done 标签 + 关闭 issue（回归：closeIssue 此
   assert.ok(github.calls.includes('closeIssue'), '流程完成后未关闭 issue，飞书卡片会谎报「已关闭」');
   assert.deepEqual(github.labels.at(-1), ['node:done']);
   assert.ok(sink.some((e) => e.event === 'issue.completed'));
+});
+
+test('观测闭环：终态事件带 attempt/endedAt/durationMs，失败事件保留 preflight 与执行面耗时；成功输出进评论', async () => {
+  const { scheduler, github, sink } = makeScheduler([openIssue()]);
+  const { conn } = makeWorker();
+  scheduler.registerWorker(conn);
+  const dispatchPlan = () =>
+    (scheduler as never as { dispatch(w: never, i: Issue, n: string): Promise<void> }).dispatch(
+      conn,
+      openIssue(),
+      'plan',
+    );
+
+  // 第一次执行失败（模拟 preflight 环境问题），携带执行面自报耗时
+  await dispatchPlan();
+  await scheduler.onRunResult(currentRun(scheduler)!.runId, 'failed', {
+    error: 'boom',
+    durationMs: 1234,
+    preflight: { passed: false, failed: ['git'] },
+  });
+
+  const failed = sink.find((e) => e.event === 'issue.node.failed')!;
+  assert.equal(failed.details!.attempt, 1, '首次失败 attempt 应为 1');
+  assert.equal(typeof failed.details!.endedAt, 'string');
+  assert.equal(typeof failed.details!.durationMs, 'number', '失败事件缺控制面耗时');
+  assert.equal(failed.details!.workerDurationMs, 1234, '执行面自报耗时未透传');
+  assert.deepEqual(failed.details!.preflight, { passed: false, failed: ['git'] });
+
+  // 同节点重派后成功：attempt = 历史失败 1 次 + 本次成功 = 2
+  await dispatchPlan();
+  await scheduler.onRunResult(currentRun(scheduler)!.runId, 'completed', {
+    output: 'agent-final-output',
+    durationMs: 4321,
+  });
+
+  const advanced = sink.find((e) => e.event === 'issue.node.advanced')!;
+  assert.equal(advanced.details!.attempt, 2, '返工后成功的 attempt 应为 2');
+  assert.equal(typeof advanced.details!.endedAt, 'string');
+  assert.equal(typeof advanced.details!.durationMs, 'number');
+  // 回归：ws.ts 曾把 output 字符串误当成 opts 对象传入，导致成功评论的输出块永远为空
+  assert.ok(
+    github.comments.some((c) => c.includes('agent-final-output')),
+    '成功输出未写入 GitHub 评论',
+  );
+});
+
+test('token 记账：transcript 真实用量优先，缺省回退注入估算；熔断累计跨失败累加', async () => {
+  const { scheduler, sink } = makeScheduler([openIssue()]);
+  const { conn } = makeWorker();
+  scheduler.registerWorker(conn);
+  const dispatchPlan = () =>
+    (scheduler as never as { dispatch(w: never, i: Issue, n: string): Promise<void> }).dispatch(
+      conn,
+      openIssue(),
+      'plan',
+    );
+
+  // 第一次失败带 transcript 用量：tokensConsumed = input + output
+  await dispatchPlan();
+  await scheduler.onRunResult(currentRun(scheduler)!.runId, 'failed', {
+    tokens: { input: 100, output: 20 },
+  });
+  const f1 = sink.filter((e) => e.event === 'issue.node.failed').at(-1)!;
+  assert.equal(f1.details!.tokensConsumed, 120, '真实用量未按 input+output 记账');
+  assert.deepEqual(f1.details!.tokens, { input: 100, output: 20 });
+
+  // 第二次失败不带 tokens：回退注入估算口径
+  await dispatchPlan();
+  await scheduler.onRunResult(currentRun(scheduler)!.runId, 'failed', {});
+  const f2 = sink.filter((e) => e.event === 'issue.node.failed').at(-1)!;
+  assert.equal(f2.details!.tokensConsumed, f2.details!.inputTokens, '无 transcript 时未回退估算口径');
+  assert.equal(f2.details!.tokens, undefined);
+
+  // 成功后 advanced 事件带真实 tokens
+  await dispatchPlan();
+  await scheduler.onRunResult(currentRun(scheduler)!.runId, 'completed', {
+    tokens: { input: 500, output: 80 },
+  });
+  const adv = sink.find((e) => e.event === 'issue.node.advanced')!;
+  assert.deepEqual(adv.details!.tokens, { input: 500, output: 80 });
+});
+
+test('HITL 计时：熔断进入精确记录，标签摘除经 tick 差分产出 waitMs；重启后首次观察带 inferred', async () => {
+  const { scheduler, sink } = makeScheduler([openIssue()]);
+  const { conn } = makeWorker();
+  scheduler.registerWorker(conn);
+  const dispatchPlan = () =>
+    (scheduler as never as { dispatch(w: never, i: Issue, n: string): Promise<void> }).dispatch(
+      conn,
+      openIssue(),
+      'plan',
+    );
+  const trackHitl = (issues: Issue[]) =>
+    (scheduler as never as { trackHitl(i: Issue[]): void }).trackHitl(issues);
+
+  // 连续失败至 DEFAULT_RETRY.maxAttempts=3 → 熔断转 HITL（onExhausted 默认 hitl）
+  for (let i = 0; i < 3; i++) {
+    await dispatchPlan();
+    await scheduler.onRunResult(currentRun(scheduler)!.runId, 'failed', { error: 'x' });
+  }
+  const entered = sink.find((e) => e.event === 'hitl.entered')!;
+  assert.ok(entered, '熔断转 HITL 未发 hitl.entered');
+  assert.equal(entered.details!.inferred, false, '熔断路径的进入应为精确记录');
+  assert.equal(entered.details!.nodeKey, 'plan');
+
+  // 人工摘标签后的下一轮 tick：差分产出 resolved + waitMs
+  trackHitl([openIssue()]);
+  const resolved = sink.find((e) => e.event === 'hitl.resolved')!;
+  assert.ok(resolved, '标签摘除未发 hitl.resolved');
+  assert.ok((resolved.details!.waitMs as number) >= 0);
+  assert.equal(resolved.details!.inferredEntry, false);
+
+  // gateway 重启后首次观察到挂起：inferred=true，解除时 waitMs 为近似值
+  trackHitl([openIssue(1, ['node:plan', 'hitl:waiting'])]);
+  const entered2 = sink.filter((e) => e.event === 'hitl.entered').at(-1)!;
+  assert.equal(entered2.details!.inferred, true);
+  trackHitl([openIssue()]);
+  const resolved2 = sink.filter((e) => e.event === 'hitl.resolved').at(-1)!;
+  assert.equal(resolved2.details!.inferredEntry, true);
+});
+
+test('HITL 超时升级：超过阈值只发一次 hitl.escalated；阈值 0 时不发', async () => {
+  const sink: HarnessEvent[] = [];
+  const scheduler = new Scheduler({
+    config: { ...makeConfig(), alerts: { hitlEscalateMs: 5 } },
+    store: makeStore() as never,
+    bus: makeBus(sink) as never,
+    github: makeGithub([]) as never,
+    circuitBreaker: new CircuitBreaker(),
+  });
+  const trackHitl = (issues: Issue[]) =>
+    (scheduler as never as { trackHitl(i: Issue[]): void }).trackHitl(issues);
+  const waiting = () => [openIssue(1, ['node:plan', 'hitl:waiting'])];
+
+  trackHitl(waiting());
+  await new Promise((r) => setTimeout(r, 8));
+  trackHitl(waiting());
+  trackHitl(waiting()); // 仍挂起：不得重复升级
+
+  const escalations = sink.filter((e) => e.event === 'hitl.escalated');
+  assert.equal(escalations.length, 1);
+  assert.ok((escalations[0].details!.waitMs as number) >= 5);
+
+  // 阈值 0（禁用）：不发升级
+  const sink2: HarnessEvent[] = [];
+  const scheduler2 = new Scheduler({
+    config: { ...makeConfig(), alerts: { hitlEscalateMs: 0 } },
+    store: makeStore() as never,
+    bus: makeBus(sink2) as never,
+    github: makeGithub([]) as never,
+    circuitBreaker: new CircuitBreaker(),
+  });
+  (scheduler2 as never as { trackHitl(i: Issue[]): void }).trackHitl(waiting());
+  await new Promise((r) => setTimeout(r, 5));
+  (scheduler2 as never as { trackHitl(i: Issue[]): void }).trackHitl(waiting());
+  assert.ok(!sink2.some((e) => e.event === 'hitl.escalated'));
 });
 
 test('回写抛错：不炸进程、发 transition_failed、锁仍然释放以便按标签重放', async () => {

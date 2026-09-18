@@ -12,7 +12,7 @@ import { estimateTokens } from '@harness/shared';
 import type { GatewayConfig } from './config.js';
 import type { EventStore } from './db.js';
 import type { EventBus } from './bus.js';
-import { detectNode, HITL_WAITING, type GithubClient, type Issue } from './github.js';
+import { detectNode, HITL_WAITING, NODE_PREFIX, type GithubClient, type Issue } from './github.js';
 import { CircuitBreaker, DEFAULT_RETRY } from './circuit-breaker.js';
 
 export interface WorkerConn {
@@ -47,6 +47,12 @@ export interface Run {
    * 且与 loop-node 侧裁剪上下文用的是同一个函数，两边口径一致。
    */
   inputTokens: number;
+  /** 收到 run.result 的时刻；与 startedAt 配对得到控制面口径的节点耗时 */
+  endedAt?: string;
+  /** 控制面口径耗时：dispatch → 收到结果（含网络与排队），ms */
+  durationMs?: number;
+  /** agent 真实用量（transcript 口径）；缺省 = 该 run 无 transcript，只有估算可用 */
+  tokens?: { input: number; output: number };
 }
 
 interface Deps {
@@ -65,12 +71,30 @@ export interface RunResultOptions {
    * 缺省时退回 DEFAULT_RETRY —— 兼容旧版 loop-node 与未声明 retry 段的模板。
    */
   retry?: RetryPolicy;
+  /** 执行面回报的前置检查摘要，失败事件据此区分环境问题与业务失败 */
+  preflight?: { passed: boolean; failed: string[] };
+  /** 执行面口径耗时（收到 launch → 发出结果），与控制面自算的 durationMs 并存 */
+  durationMs?: number;
+  /** agent 真实用量（transcript 口径）；缺省表示拿不到，回退注入估算 */
+  tokens?: { input: number; output: number };
+}
+
+interface HitlRecord {
+  nodeKey: string;
+  enteredAt: number;
+  runId?: string;
+  /** true = 进入时刻非本方写入（gateway 重启后首次观察到挂起），waitMs 为近似值 */
+  inferred: boolean;
+  /** 超时升级告警是否已发过（每次挂起最多一次） */
+  escalated?: boolean;
 }
 
 export class Scheduler {
   private workers = new Map<string, WorkerConn>();
   private runsByIssue = new Map<number, Run>();
   private runsByRunId = new Map<string, Run>();
+  /** HITL 挂起追踪：issueNumber → 进入时刻。tick 中差分标签变化产生 hitl.entered/resolved */
+  private hitlSince = new Map<number, HitlRecord>();
   private timer?: NodeJS.Timeout;
   private healthTimer?: NodeJS.Timeout;
   private ticking = false;
@@ -208,6 +232,9 @@ export class Scheduler {
     this.ticking = true;
     try {
       const issues = await this.deps.github.listIssues();
+      // 先差分 HITL 状态再走派发：人工摘标签的 resolved 事件先于重新派发落库，
+      // 看板时间线上「解除等待 → 重新执行」的顺序才正确
+      this.trackHitl(issues);
       for (const issue of issues) {
         // issue 去重锁：正在执行或正在回写的 issue 本轮直接跳过
         if (this.runsByIssue.has(issue.number)) continue;
@@ -217,6 +244,69 @@ export class Scheduler {
       console.error('[scheduler] tick 失败:', (e as Error).message);
     } finally {
       this.ticking = false;
+    }
+  }
+
+  /**
+   * HITL 生命周期差分：每轮 tick 对比 issue 标签与本方记录。
+   *
+   * 进入：熔断路径在 transition 里直接写入精确时刻；其余来源（人工打 hitl: 标签、
+   * gateway 重启后首次观察到挂起）按首次观察时刻近似，事件标 inferred: true。
+   * 解除：上一轮挂起、本轮标签已无 hitl: → hitl.resolved + waitMs；
+   * issue 关闭或从 open 列表消失同样视为解除（resolvedBy: issue_gone）。
+   * 记录只在内存：跨重启的挂起无法还原进入时刻，用首次观察兜底而非静默丢失。
+   */
+  private trackHitl(issues: Issue[]) {
+    const openNumbers = new Set(issues.map((i) => i.number));
+    for (const issue of issues) {
+      const suspended = detectNode(issue, this.deps.config.pipeline).suspended;
+      const rec = this.hitlSince.get(issue.number);
+      if (suspended && !rec) {
+        const nodeKey = issue.labels.find((l) => l.startsWith(NODE_PREFIX))?.slice(NODE_PREFIX.length) ?? 'unknown';
+        this.hitlSince.set(issue.number, { nodeKey, enteredAt: Date.now(), inferred: true });
+        this.emit('github', 'hitl.entered', {
+          workItemId: String(issue.number),
+          details: { nodeKey, inferred: true },
+        });
+      } else if (!suspended && rec) {
+        this.hitlSince.delete(issue.number);
+        this.emit('github', 'hitl.resolved', {
+          workItemId: String(issue.number),
+          runId: rec.runId,
+          details: {
+            nodeKey: rec.nodeKey,
+            waitMs: Date.now() - rec.enteredAt,
+            inferredEntry: rec.inferred,
+          },
+        });
+      } else if (suspended && rec) {
+        // 仍在挂起：达到升级阈值且未发过 → 升级告警（白名单通知据此 @ 值班人）
+        const threshold = this.deps.config.alerts?.hitlEscalateMs ?? 0;
+        const waitMs = Date.now() - rec.enteredAt;
+        if (threshold > 0 && !rec.escalated && waitMs >= threshold) {
+          rec.escalated = true;
+          this.emit('harness', 'hitl.escalated', {
+            workItemId: String(issue.number),
+            runId: rec.runId,
+            details: { nodeKey: rec.nodeKey, waitMs, thresholdMs: threshold, inferredEntry: rec.inferred },
+          });
+        }
+      }
+    }
+    for (const [number, rec] of this.hitlSince) {
+      if (!openNumbers.has(number)) {
+        this.hitlSince.delete(number);
+        this.emit('github', 'hitl.resolved', {
+          workItemId: String(number),
+          runId: rec.runId,
+          details: {
+            nodeKey: rec.nodeKey,
+            waitMs: Date.now() - rec.enteredAt,
+            inferredEntry: rec.inferred,
+            resolvedBy: 'issue_gone',
+          },
+        });
+      }
     }
   }
 
@@ -303,6 +393,11 @@ export class Scheduler {
     if (!run) return;
 
     run.status = status;
+    // 在任何 await 之前闭合时间窗：transition 内的 listIssues / 回写耗时
+    // 不计入节点执行耗时，口径为「dispatch → 收到结果」
+    run.endedAt = new Date().toISOString();
+    run.durationMs = Date.now() - Date.parse(run.startedAt);
+    if (opts.tokens) run.tokens = opts.tokens;
 
     // worker 容量立即释放：它可以马上接「别的 issue」的活。
     const worker = this.workers.get(run.workerId);
@@ -355,8 +450,13 @@ export class Scheduler {
       return;
     }
 
+    const runKey = `${run.issueNumber}:${run.nodeKey}`;
+
     if (status === 'completed') {
-      this.deps.circuitBreaker.reset(`${run.issueNumber}:${run.nodeKey}`);
+      // 总尝试次数 = 历史失败次数 + 本次成功；必须在 reset 清账前读取，
+      // 一次通过时 attemptsOf 返回 0 → attempt=1
+      const attempt = this.deps.circuitBreaker.attemptsOf(runKey) + 1;
+      this.deps.circuitBreaker.reset(runKey);
 
       const outputBlock = [
         '',
@@ -374,17 +474,18 @@ export class Scheduler {
         issue,
         run,
         `### ✅ 节点 \`${run.nodeKey}\` 执行完成${outputBlock}`,
+        attempt,
       );
       return;
     }
 
     // ---- 失败：记账 + 熔断判定在同一次调用内完成，再发失败事件 ----
-    const runKey = `${run.issueNumber}:${run.nodeKey}`;
-
     // token 维度接线：失败路径才记账，成功即 reset。
-    // 口径是「本次派发注入的上下文 token 估算值」，不是 provider 报的精确 usage
-    // （最小契约下拿不到）。量级足够拦「同一节点反复重跑导致的上下文重复注入」。
-    const check = this.deps.circuitBreaker.check(runKey, policy, run.inputTokens);
+    // 口径优先级：worker 回报的 transcript 真实用量 > 注入上下文估算（旧版
+    // loop-node 或 agent 无 transcript 时唯一可用）。真实口径覆盖 agent 多轮
+    // 消耗，拦截更准；估算口径兜底拦截「同节点反复重跑的上下文重复注入」。
+    const tokensConsumed = run.tokens ? run.tokens.input + run.tokens.output : run.inputTokens;
+    const check = this.deps.circuitBreaker.check(runKey, policy, tokensConsumed);
     const accumulated = this.deps.circuitBreaker.tokens(runKey);
 
     this.emit('github', 'issue.node.failed', {
@@ -395,8 +496,17 @@ export class Scheduler {
         error: (error ?? 'unknown error').slice(0, 2000),
         inputTokens: run.inputTokens,
         accumulatedTokens: accumulated,
+        tokensConsumed,
+        // 两种口径并存：transcript 真实值与注入估算，看板/告警按需取用
+        tokens: run.tokens,
         attempt: check.attempt,
         policy: { maxAttempts: policy.maxAttempts, onExhausted: policy.onExhausted },
+        // 耗时闭环：控制面口径 dispatch→结果，及执行面自报口径
+        endedAt: run.endedAt,
+        durationMs: run.durationMs,
+        workerDurationMs: opts.durationMs,
+        // 环境问题（preflight 失败）与业务执行失败在此分流
+        preflight: opts.preflight,
       },
     });
 
@@ -408,6 +518,7 @@ export class Scheduler {
           nodeKey: run.nodeKey,
           reason: check.reason,
           onExhausted: policy.onExhausted,
+          accumulatedTokens: accumulated,
         },
       });
 
@@ -420,6 +531,7 @@ export class Scheduler {
           issue,
           run,
           `节点 \`${run.nodeKey}\` 已熔断，按策略跳过：${check.reason}`,
+          check.attempt,
         );
         return;
       }
@@ -441,6 +553,18 @@ export class Scheduler {
         `### 🛑 熔断触发\n\n节点 \`${run.nodeKey}\` 已中止：${check.reason}\n\n需要人工介入。`,
       );
       await this.deps.github.setLabels(issue.number, [HITL_WAITING]);
+      // 进入时刻由本方写入，最精确；摘除时刻靠 trackHitl 在 tick 中对比标签差分
+      this.hitlSince.set(issue.number, {
+        nodeKey: run.nodeKey,
+        enteredAt: Date.now(),
+        runId: run.runId,
+        inferred: false,
+      });
+      this.emit('harness', 'hitl.entered', {
+        runId: run.runId,
+        workItemId: String(issue.number),
+        details: { nodeKey: run.nodeKey, reason: check.reason, inferred: false },
+      });
       return;
     }
 
@@ -464,19 +588,35 @@ export class Scheduler {
    *
    * runId 必须随事件带出：Dashboard 与通知卡片靠它把「节点流转」关联回
    * 具体那次执行，丢了就只能看到孤立的 issue 级事件。
+   *
+   * @param attempt 该节点累计执行次数：成功路径为「历史失败 + 1」，跳过路径为失败次数
    */
-  private async advance(issue: Issue, run: Run, comment: string) {
+  private async advance(issue: Issue, run: Run, comment: string, attempt: number) {
     const next =
       this.deps.config.pipeline[this.deps.config.pipeline.indexOf(run.nodeKey) + 1];
 
     await this.deps.github.addComment(issue.number, comment);
+
+    // 节点级观测字段：attempt 还原返工/重试，endedAt+durationMs 闭合节点耗时。
+    // 执行面口径耗时保留在 worker run.completed 原始事件中（同 runId 可关联）。
+    // nodeKey 必须随两个事件都带：评分按「刚执行完的节点」归属这些指标，
+    // 不能让消费方从 from/to 或事件顺序反推（末节点 completed 没有 to）。
+    const nodeMetrics = {
+      nodeKey: run.nodeKey,
+      attempt,
+      endedAt: run.endedAt,
+      durationMs: run.durationMs,
+      tokens: run.tokens,
+      // 成功路径也要带注入估算：无 transcript 时评分用它做耗时/返工的兜底口径
+      inputTokens: run.inputTokens,
+    };
 
     if (next) {
       await this.deps.github.setLabels(issue.number, [`node:${next}`]);
       this.emit('github', 'issue.node.advanced', {
         workItemId: String(issue.number),
         runId: run.runId,
-        details: { from: run.nodeKey, to: next },
+        details: { from: run.nodeKey, to: next, ...nodeMetrics },
       });
       return;
     }
@@ -486,6 +626,7 @@ export class Scheduler {
     this.emit('github', 'issue.completed', {
       workItemId: String(issue.number),
       runId: run.runId,
+      details: nodeMetrics,
     });
   }
 

@@ -112,4 +112,27 @@ export class EventStore {
       .all(limit) as RawRow[];
     return rows.reverse().map(mapRow);
   }
+
+  /**
+   * 证据包查询：取某 issue 的全部事件。
+   *
+   * worker 原始事件（run.progress/run.completed/run.failed）落库时只带 runId、
+   * 不带 workItemId（执行面不知道 issue 编号），所以要先按 work_item_id 查出
+   * runId 集合，再按 run_id 补查，两集合并去重后按 seq 排序。
+   * 同步驱动 + 两次主键/索引查询，调用方无需担心并发。
+   */
+  findByWorkItem(workItemId: string): HarnessEvent[] {
+    const direct = this.db
+      .prepare('SELECT * FROM events WHERE work_item_id = ?')
+      .all(workItemId) as RawRow[];
+    const runIds = [...new Set(direct.map((r) => r.run_id).filter((v): v is string => !!v))];
+    const byRun = runIds.length
+      ? (this.db
+          .prepare(`SELECT * FROM events WHERE run_id IN (${runIds.map(() => '?').join(',')})`)
+          .all(...runIds) as RawRow[])
+      : [];
+    const merged = new Map<number, RawRow>();
+    for (const r of [...direct, ...byRun]) merged.set(r.seq, r);
+    return [...merged.values()].sort((a, b) => a.seq - b.seq).map(mapRow);
+  }
 }

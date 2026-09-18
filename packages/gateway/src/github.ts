@@ -20,7 +20,25 @@ export interface GithubClient {
   closeIssue(issueNumber: number): Promise<void>;
 }
 
+/** 一次 GitHub API 逻辑调用（含内部重试）的观测记录，对应 Meego 的 raw API 证据。 */
+export interface ApiCallRecord {
+  method: string;
+  /** 不含 host，形如 /issues?state=open 或 /issues/3/comments */
+  path: string;
+  /** 实际发出的 HTTP 请求次数（连接失败/5xx 重试会 >1） */
+  attempts: number;
+  status?: number;
+  ok: boolean;
+  /** 整次逻辑调用耗时（含重试等待），ms */
+  latencyMs: number;
+  /** 失败时的错误摘要（含状态码与响应体片段），成功时省略 */
+  error?: string;
+}
+
+export type ApiCallSink = (rec: ApiCallRecord) => void;
+
 const NODE_PREFIX = 'node:';
+export { NODE_PREFIX };
 /** 人工卡点标签前缀。带此前缀的 issue 表示流程已挂起，调度必须跳过。 */
 const HITL_PREFIX = 'hitl:';
 /** 熔断或需要人工判断时打上的挂起标签。 */
@@ -70,11 +88,11 @@ export function detectNode(issue: Issue, pipeline: string[]): NodeDetection {
   };
 }
 
-export function createGithubClient(config: GatewayConfig): GithubClient {
-  return config.github.mode === 'real' ? realClient(config) : mockClient();
+export function createGithubClient(config: GatewayConfig, sink?: ApiCallSink): GithubClient {
+  return config.github.mode === 'real' ? realClient(config, sink) : mockClient();
 }
 
-function realClient(config: GatewayConfig): GithubClient {
+function realClient(config: GatewayConfig, sink?: ApiCallSink): GithubClient {
   const { token, owner, repo } = config.github;
   if (!token || !owner || !repo) {
     throw new Error('GITHUB_TOKEN / GITHUB_OWNER / GITHUB_REPO 必须同时提供');
@@ -92,38 +110,63 @@ function realClient(config: GatewayConfig): GithubClient {
 
   async function call(p: string, init?: RequestInit) {
     const method = (init?.method ?? 'GET').toUpperCase();
+    // openapi 证据：一次逻辑调用（含重试等待）落一条记录，在 finally 统一发出，
+    // 成功/重试耗尽/连接失败三条出口都不会漏；鉴权头不记录，path 只含 issue 编号无密钥
+    const startedAt = Date.now();
+    let tries = 0;
+    let finalStatus: number | undefined;
+    let settled = false;
     let lastErr: unknown;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        const res = await fetch(base + p, {
-          ...init,
-          headers: { ...headers, ...((init?.headers as Record<string, string>) ?? {}) },
-        });
-        // GET 请求遇到 5xx/429 可安全重试；POST/PATCH/DELETE 已到达服务器，不自动重试
-        if ((res.status >= 500 || res.status === 429) && method === 'GET' && attempt < MAX_ATTEMPTS) {
-          await sleep(500 * 2 ** (attempt - 1));
-          continue;
+    const emit = () =>
+      sink?.({
+        method,
+        path: p,
+        attempts: tries,
+        status: finalStatus,
+        ok: settled,
+        latencyMs: Date.now() - startedAt,
+        error: settled
+          ? undefined
+          : ((lastErr as Error)?.message ?? 'unknown error').slice(0, 500),
+      });
+    try {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          tries += 1;
+          const res = await fetch(base + p, {
+            ...init,
+            headers: { ...headers, ...((init?.headers as Record<string, string>) ?? {}) },
+          });
+          finalStatus = res.status;
+          // GET 请求遇到 5xx/429 可安全重试；POST/PATCH/DELETE 已到达服务器，不自动重试
+          if ((res.status >= 500 || res.status === 429) && method === 'GET' && attempt < MAX_ATTEMPTS) {
+            await sleep(500 * 2 ** (attempt - 1));
+            continue;
+          }
+          if (!res.ok) {
+            throw new Error(`GitHub ${res.status} ${p}: ${await res.text()}`);
+          }
+          settled = true;
+          return res;
+        } catch (e) {
+          lastErr = e;
+          // 连接级失败（DNS/TLS 握手中断 ECONNRESET、网络瞬断）：请求未确认到达服务器，任何方法都可安全重试
+          const isConnectionLevel =
+            e instanceof TypeError || (e as { code?: string })?.code === 'ECONNRESET';
+          if (attempt < MAX_ATTEMPTS && isConnectionLevel) {
+            console.warn(
+              `[github] 请求失败(${attempt}/${MAX_ATTEMPTS})，${500 * 2 ** (attempt - 1)}ms 后重试: ${(e as Error).message}`,
+            );
+            await sleep(500 * 2 ** (attempt - 1));
+            continue;
+          }
+          throw e;
         }
-        if (!res.ok) {
-          throw new Error(`GitHub ${res.status} ${p}: ${await res.text()}`);
-        }
-        return res;
-      } catch (e) {
-        lastErr = e;
-        // 连接级失败（DNS/TLS 握手中断 ECONNRESET、网络瞬断）：请求未确认到达服务器，任何方法都可安全重试
-        const isConnectionLevel =
-          e instanceof TypeError || (e as { code?: string })?.code === 'ECONNRESET';
-        if (attempt < MAX_ATTEMPTS && isConnectionLevel) {
-          console.warn(
-            `[github] 请求失败(${attempt}/${MAX_ATTEMPTS})，${500 * 2 ** (attempt - 1)}ms 后重试: ${(e as Error).message}`,
-          );
-          await sleep(500 * 2 ** (attempt - 1));
-          continue;
-        }
-        throw e;
       }
+      throw lastErr;
+    } finally {
+      emit();
     }
-    throw lastErr;
   }
 
   return {

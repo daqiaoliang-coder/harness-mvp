@@ -90,6 +90,11 @@ export class CircuitBreaker {
     return this.attempts.get(runKey)?.tokens ?? 0;
   }
 
+  /** 读取已累计的失败次数（无记录为 0）；成功事件在 reset 前用它还原总尝试次数。 */
+  attemptsOf(runKey: string): number {
+    return this.attempts.get(runKey)?.attempt ?? 0;
+  }
+
   reset(runKey: string) {
     this.attempts.delete(runKey);
   }

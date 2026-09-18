@@ -15,6 +15,7 @@ import { runAgent, type AgentHandle } from './pty.js';
 import { loadTemplate, renderPrompt } from './templates.js';
 import { runPreflight, resolvePreflightConfig } from './preflight.js';
 import { createOutputBuffer } from './output-buffer.js';
+import { collectUsage } from './usage.js';
 
 const config = loadConfig();
 
@@ -298,6 +299,9 @@ function connect() {
 async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
   const { runId, nodeKey, workItemId, context } = msg;
   console.log(`[loop-node] ▶ launch runId=${runId} node=${nodeKey} issue=#${workItemId}`);
+  // worker 侧耗时基准：覆盖模板加载 → preflight → prompt 落盘 → agent 退出的全过程，
+  // 每个终态上报点（含启动前失败）都用它算 durationMs，保证失败也有耗时可观测
+  const launchedAt = Date.now();
 
   /**
    * 模板先于前置检查加载。
@@ -316,6 +320,7 @@ async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
       runId,
       status: 'failed',
       error: `模板加载失败: ${(err as Error).message}`,
+      durationMs: Date.now() - launchedAt,
     });
     return;
   }
@@ -338,6 +343,7 @@ async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
       error: `前置检查未通过:\n${detail}`,
       retry,
       preflight,
+      durationMs: Date.now() - launchedAt,
     });
     return;
   }
@@ -378,6 +384,7 @@ async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
       error: `prompt 文件写入失败: ${(err as Error).message}`,
       retry,
       preflight,
+      durationMs: Date.now() - launchedAt,
     });
     return;
   }
@@ -461,6 +468,9 @@ async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
             : undefined,
           retry,
           preflight,
+          durationMs: Date.now() - launchedAt,
+          // 真实用量：mock agent / transcript 缺失时为 undefined，控制面回落估算口径
+          tokens: collectUsage(workdir),
         });
       },
     });
@@ -473,6 +483,7 @@ async function handleLaunch(msg: Extract<GatewayToWorker, { type: 'launch' }>) {
       error: `agent 启动失败: ${(err as Error).message}`,
       retry,
       preflight,
+      durationMs: Date.now() - launchedAt,
     });
     return;
   }

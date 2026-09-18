@@ -31,6 +31,13 @@ export interface GatewayConfig {
     /** 机器人启用了「签名校验」时对应的加签密钥 */
     webhookSecret?: string;
   };
+  alerts: {
+    /**
+     * HITL 挂起超过该时长未解除则升级告警（每个挂起只发一次）。
+     * 0 = 关闭升级；默认 30 分钟。
+     */
+    hitlEscalateMs: number;
+  };
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -67,6 +74,9 @@ export function loadConfig(): GatewayConfig {
     feishu: {
       webhookUrl: process.env.FEISHU_WEBHOOK_URL || undefined,
       webhookSecret: process.env.FEISHU_WEBHOOK_SECRET || undefined,
+    },
+    alerts: {
+      hitlEscalateMs: Number(process.env.HITL_ESCALATE_MS ?? 30 * 60 * 1000),
     },
   };
 }

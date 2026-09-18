@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectNode } from './github.js';
+import { createGithubClient, detectNode, type ApiCallRecord } from './github.js';
+import type { GatewayConfig } from './config.js';
 
 const pipeline = ['plan', 'code', 'test'];
 
@@ -68,4 +69,45 @@ test('detectNode: 未知节点标签 → current 归 null、index -1，调度应
 test('detectNode: 空 pipeline 且无标签 → current 为 null', () => {
   const r = detectNode(issue([]), []);
   assert.deepEqual(r, { current: null, index: 0, isNew: true, suspended: false });
+});
+
+const realConfig = {
+  github: { mode: 'real' as const, token: 't', owner: 'o', repo: 'r', pollIntervalMs: 1 },
+} as unknown as GatewayConfig;
+
+test('openapi 埋点：成功调用记录 method/status/attempts/latency', async () => {
+  const orig = globalThis.fetch;
+  const records: ApiCallRecord[] = [];
+  globalThis.fetch = (async () => new Response('[]', { status: 200 })) as typeof fetch;
+  try {
+    const client = createGithubClient(realConfig, (r) => records.push(r));
+    const issues = await client.listIssues();
+    assert.deepEqual(issues, []);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].ok, true);
+    assert.equal(records[0].status, 200);
+    assert.equal(records[0].attempts, 1);
+    assert.equal(records[0].method, 'GET');
+    assert.match(records[0].path, /issues/);
+    assert.equal(records[0].error, undefined);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('openapi 埋点：POST 404 不重试，失败记录带状态码与错误摘要', async () => {
+  const orig = globalThis.fetch;
+  const records: ApiCallRecord[] = [];
+  globalThis.fetch = (async () => new Response('not found', { status: 404 })) as typeof fetch;
+  try {
+    const client = createGithubClient(realConfig, (r) => records.push(r));
+    await assert.rejects(() => client.addComment(1, 'x'), /404/);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].ok, false);
+    assert.equal(records[0].status, 404);
+    assert.equal(records[0].attempts, 1, '非幂等请求不应重试');
+    assert.match(records[0].error ?? '', /404/);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
